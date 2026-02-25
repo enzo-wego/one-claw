@@ -177,11 +177,11 @@ export function registerHandlers(
     // Skip discuss channels — handled by discuss-monitor
     if (!isDm && isDiscussChannel(msg.channel)) return;
 
-    // Owner: always respond
+    // Owner: always respond in DMs, only on @mention in channels
     if (isDm) {
       const replyThreadTs = msg.thread_ts as string | undefined;
       await handleMessage(app, msg.channel, msg.channel, msg.ts, userId, text, replyThreadTs);
-    } else {
+    } else if (hasMention) {
       const threadTs = (msg.thread_ts || msg.ts) as string;
       await handleMessage(app, msg.channel, threadTs, msg.ts, userId, text, threadTs);
     }

@@ -1,3 +1,16 @@
+// Prepend timestamps to all console output
+function timestamp(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+const origLog = console.log.bind(console);
+const origError = console.error.bind(console);
+const origWarn = console.warn.bind(console);
+console.log = (...args: unknown[]) => origLog(`[${timestamp()}]`, ...args);
+console.error = (...args: unknown[]) => origError(`[${timestamp()}] ERROR`, ...args);
+console.warn = (...args: unknown[]) => origWarn(`[${timestamp()}] WARN`, ...args);
+
 import { config } from "./config.js";
 import { initDatabase, closeDatabase } from "./services/database.js";
 import { startHttpServer, setSlackConnected, setDailySummaryTrigger, stopHttpServer } from "./server.js";
@@ -51,7 +64,43 @@ function triggerDailySummary(): void {
     ownerUserId: config.ownerUserId,
     model: config.dailySummaryModel,
     sendDm: async (userId: string, text: string) => {
-      await app.client.chat.postMessage({ channel: userId, text });
+      const MAX_LENGTH = 3900;
+      if (text.length <= MAX_LENGTH) {
+        await app.client.chat.postMessage({ channel: userId, text });
+        return;
+      }
+
+      // Split into chunks at paragraph boundaries, thread replies after first
+      const chunks: string[] = [];
+      let remaining = text;
+      while (remaining.length > 0) {
+        if (remaining.length <= MAX_LENGTH) {
+          chunks.push(remaining);
+          break;
+        }
+        // Find last paragraph break within limit
+        let splitAt = remaining.lastIndexOf("\n\n", MAX_LENGTH);
+        if (splitAt <= 0) splitAt = remaining.lastIndexOf("\n", MAX_LENGTH);
+        if (splitAt <= 0) splitAt = MAX_LENGTH;
+        chunks.push(remaining.slice(0, splitAt));
+        remaining = remaining.slice(splitAt).replace(/^\n+/, "");
+      }
+
+      // First chunk as the main message
+      const first = await app.client.chat.postMessage({
+        channel: userId,
+        text: chunks[0],
+      });
+      const threadTs = first.ts;
+
+      // Remaining chunks as thread replies
+      for (let i = 1; i < chunks.length; i++) {
+        await app.client.chat.postMessage({
+          channel: userId,
+          text: chunks[i],
+          thread_ts: threadTs,
+        });
+      }
     },
   }).catch((err) => console.error("[DailySummary] Failed:", err));
 }
