@@ -200,6 +200,33 @@ export function getActiveWorkflow(threadTs: string): ActiveWorkflow | undefined 
   return workflows.get(threadTs);
 }
 
+export function getAllAlertWorkflows(): Array<{
+  threadTs: string;
+  channelId: string;
+  incidentId: string | null;
+  hasCliChild: boolean;
+}> {
+  return Array.from(workflows.entries()).map(([threadTs, w]) => ({
+    threadTs,
+    channelId: w.channelId,
+    incidentId: w.incidentId,
+    hasCliChild: w.cliChild !== null,
+  }));
+}
+
+export function killAlertWorkflow(threadTs: string): boolean {
+  const workflow = workflows.get(threadTs);
+  if (!workflow) return false;
+  clearFeedbackTimer(workflow);
+  if (workflow.cliChild) {
+    workflow.cliChild.kill("SIGTERM");
+    workflow.cliChild = null;
+  }
+  workflows.delete(threadTs);
+  console.log(`[AlertWorkflow] Killed workflow for thread ${threadTs} via API`);
+  return true;
+}
+
 export function killAllWorkflows(): void {
   for (const [key, workflow] of workflows) {
     clearFeedbackTimer(workflow);

@@ -371,6 +371,34 @@ export function getActiveDiscussion(
   return discussions.get(threadTs);
 }
 
+export function getAllDiscussions(): Array<{
+  threadTs: string;
+  channelId: string;
+  cliSessionId: string | null;
+  isProcessing: boolean;
+  hasCliChild: boolean;
+}> {
+  return Array.from(discussions.entries()).map(([threadTs, d]) => ({
+    threadTs,
+    channelId: d.channelId,
+    cliSessionId: d.cliSessionId,
+    isProcessing: d.isProcessing,
+    hasCliChild: d.cliChild !== null,
+  }));
+}
+
+export function killDiscussSession(threadTs: string): boolean {
+  const discussion = discussions.get(threadTs);
+  if (!discussion) return false;
+  if (discussion.cliChild) {
+    discussion.cliChild.kill("SIGTERM");
+    discussion.cliChild = null;
+  }
+  discussions.delete(threadTs);
+  console.log(`[Discuss] Killed session for thread ${threadTs} via API`);
+  return true;
+}
+
 export function killAllDiscussWorkflows(): void {
   let killed = 0;
   for (const [key, discussion] of discussions) {

@@ -129,6 +129,11 @@ export function getMessages(sessionId: string): Message[] {
 }
 
 export function getActiveSessionCount(): number {
+  const row = getDb().prepare("SELECT COUNT(*) as count FROM sessions WHERE thread_ts IS NOT NULL").get() as { count: number };
+  return row.count;
+}
+
+export function getTotalSessionCount(): number {
   const row = getDb().prepare("SELECT COUNT(*) as count FROM sessions").get() as { count: number };
   return row.count;
 }

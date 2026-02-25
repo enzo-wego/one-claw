@@ -147,6 +147,33 @@ export function getActiveDelayWorkflow(
   return workflows.get(threadTs);
 }
 
+export function getAllDelayWorkflows(): Array<{
+  threadTs: string;
+  channelId: string;
+  dagName: string;
+  hasCliChild: boolean;
+}> {
+  return Array.from(workflows.entries()).map(([threadTs, w]) => ({
+    threadTs,
+    channelId: w.channelId,
+    dagName: w.dagName,
+    hasCliChild: w.cliChild !== null,
+  }));
+}
+
+export function killDelayWorkflow(threadTs: string): boolean {
+  const workflow = workflows.get(threadTs);
+  if (!workflow) return false;
+  clearFeedbackTimer(workflow);
+  if (workflow.cliChild) {
+    workflow.cliChild.kill("SIGTERM");
+    workflow.cliChild = null;
+  }
+  workflows.delete(threadTs);
+  console.log(`[DelayAlertWorkflow] Killed workflow for thread ${threadTs} via API`);
+  return true;
+}
+
 export function isWorkflowActiveForDag(dagName: string): boolean {
   for (const workflow of workflows.values()) {
     if (workflow.dagName === dagName) return true;
