@@ -112,43 +112,43 @@ Configure: `DISCUSS_CHANNELS`, `DISCUSS_MODEL`
 
 ## HTTP Endpoints
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/` | GET | Status page (HTML) |
-| `/health` | GET | Health check (JSON): uptime, Slack connection, active sessions |
-| `/daily-summary` | POST | Manually trigger daily summary |
+| Endpoint         | Method | Description                                                    |
+|------------------|--------|----------------------------------------------------------------|
+| `/`              | GET    | Status page (HTML)                                             |
+| `/health`        | GET    | Health check (JSON): uptime, Slack connection, active sessions |
+| `/daily-summary` | POST   | Manually trigger daily summary                                 |
 
 ## Configuration
 
 All configuration is via environment variables (`.env` file). See `.env.example` for the full reference with descriptions.
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `SLACK_BOT_TOKEN` | Yes | — | `xoxb-...` bot token |
-| `SLACK_APP_TOKEN` | Yes | — | `xapp-...` app-level token |
-| `SLACK_SIGNING_SECRET` | Yes | — | Slack signing secret |
-| `OWNER_USER_ID` | Yes | — | Slack user ID of the bot owner |
-| `DATABASE_PATH` | No | `./data/bot.db` | SQLite database path |
-| `PORT` | No | `3000` | HTTP server port |
-| `AGENT_MODEL` | No | `sonnet` | Claude model for DM chat |
-| `DAILY_RESTART_HOUR` | No | `23` | Hour (0-23) to auto-restart |
-| `DAILY_SUMMARY_CHANNELS` | No | — | Comma-separated channel names |
-| `DAILY_SUMMARY_TIME` | No | `07:00` | Schedule time (HH:MM, local) |
-| `DAILY_SUMMARY_MODEL` | No | `sonnet` | Model for summaries |
-| `MONITOR_CHANNELS` | No | — | PagerDuty alert channels (prefix `!` to disable) |
-| `ALERT_SKILL` | No | `one:pay-ops-production` | Skill invoked for PD alerts |
-| `ALERT_MODEL` | No | `claude-opus-4-6` | Model for alert investigation |
-| `PAGERDUTY_API_TOKEN` | No | — | PagerDuty API token |
-| `PAGERDUTY_FROM_EMAIL` | No | — | PagerDuty "From" email |
-| `MONITOR_DELAY_CHANNELS` | No | — | Airflow delay channels (prefix `!` to disable) |
-| `DELAY_ALERT_TASK_PATTERNS` | No | — | Task name patterns (CSV) |
-| `DELAY_ALERT_THRESHOLD` | No | `3` | Alert count before triggering |
-| `DELAY_ALERT_WINDOW_MS` | No | `3600000` | Time window (ms) |
-| `DELAY_ALERT_SKILL` | No | `one:pay-ops-tax-production` | Skill for delay alerts |
-| `DISCUSS_CHANNELS` | No | — | Discuss channel names (CSV) |
-| `DISCUSS_MODEL` | No | `claude-sonnet-4-5-20250929` | Model for discuss sessions |
-| `PAYMENTS_REPO_PATH` | No | `~/go/src/github.com/payments` | Working directory for CLI processes |
-| `REQUIRED_MCP_SERVERS` | No | `chrome-devtools,athena` | MCP servers to force-enable |
+| Variable                    | Required | Default                        | Description                                      |
+|-----------------------------|----------|--------------------------------|--------------------------------------------------|
+| `SLACK_BOT_TOKEN`           | Yes      | —                              | `xoxb-...` bot token                             |
+| `SLACK_APP_TOKEN`           | Yes      | —                              | `xapp-...` app-level token                       |
+| `SLACK_SIGNING_SECRET`      | Yes      | —                              | Slack signing secret                             |
+| `OWNER_USER_ID`             | Yes      | —                              | Slack user ID of the bot owner                   |
+| `DATABASE_PATH`             | No       | `./data/bot.db`                | SQLite database path                             |
+| `PORT`                      | No       | `3000`                         | HTTP server port                                 |
+| `AGENT_MODEL`               | No       | `sonnet`                       | Claude model for DM chat                         |
+| `DAILY_RESTART_HOUR`        | No       | `23`                           | Hour (0-23) to auto-restart                      |
+| `DAILY_SUMMARY_CHANNELS`    | No       | —                              | Comma-separated channel names                    |
+| `DAILY_SUMMARY_TIME`        | No       | `07:00`                        | Schedule time (HH:MM, local)                     |
+| `DAILY_SUMMARY_MODEL`       | No       | `sonnet`                       | Model for summaries                              |
+| `MONITOR_CHANNELS`          | No       | —                              | PagerDuty alert channels (prefix `!` to disable) |
+| `ALERT_SKILL`               | No       | `one:pay-ops-production`       | Skill invoked for PD alerts                      |
+| `ALERT_MODEL`               | No       | `claude-opus-4-6`              | Model for alert investigation                    |
+| `PAGERDUTY_API_TOKEN`       | No       | —                              | PagerDuty API token                              |
+| `PAGERDUTY_FROM_EMAIL`      | No       | —                              | PagerDuty "From" email                           |
+| `MONITOR_DELAY_CHANNELS`    | No       | —                              | Airflow delay channels (prefix `!` to disable)   |
+| `DELAY_ALERT_TASK_PATTERNS` | No       | —                              | Task name patterns (CSV)                         |
+| `DELAY_ALERT_THRESHOLD`     | No       | `3`                            | Alert count before triggering                    |
+| `DELAY_ALERT_WINDOW_MS`     | No       | `3600000`                      | Time window (ms)                                 |
+| `DELAY_ALERT_SKILL`         | No       | `one:pay-ops-tax-production`   | Skill for delay alerts                           |
+| `DISCUSS_CHANNELS`          | No       | —                              | Discuss channel names (CSV)                      |
+| `DISCUSS_MODEL`             | No       | `claude-sonnet-4-5-20250929`   | Model for discuss sessions                       |
+| `PAYMENTS_REPO_PATH`        | No       | `~/go/src/github.com/payments` | Working directory for CLI processes              |
+| `REQUIRED_MCP_SERVERS`      | No       | `chrome-devtools,athena`       | MCP servers to force-enable                      |
 
 ## Architecture
 
