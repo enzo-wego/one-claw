@@ -9,7 +9,10 @@ const origError = console.error.bind(console);
 const origWarn = console.warn.bind(console);
 console.log = (...args: unknown[]) => origLog(`[${timestamp()}]`, ...args);
 console.error = (...args: unknown[]) => origError(`[${timestamp()}] ERROR`, ...args);
-console.warn = (...args: unknown[]) => origWarn(`[${timestamp()}] WARN`, ...args);
+console.warn = (...args: unknown[]) => {
+  if (typeof args[0] === "string" && args[0].includes("pong wasn't received")) return;
+  origWarn(`[${timestamp()}] WARN`, ...args);
+};
 
 import { config } from "./config.js";
 import { initDatabase, closeDatabase } from "./services/database.js";
@@ -17,13 +20,12 @@ import { startHttpServer, setSlackConnected, setDailySummaryTrigger, stopHttpSer
 import { registerHandlers } from "./handlers/message.js";
 import { registerAlertMonitor, resolveMonitorChannels } from "./handlers/alert-monitor.js";
 import { resolveDelayChannels, registerDelayAlertMonitor } from "./handlers/delay-alert-monitor.js";
-import { resolveDiscussChannels, registerDiscussMonitor } from "./handlers/discuss-monitor.js";
 import { runDailySummary } from "./services/daily-summary.js";
 import { killAllWorkflows } from "./services/alert-workflow.js";
 import { killAllDelayWorkflows } from "./services/delay-alert-workflow.js";
 import { killAllDiscussWorkflows } from "./services/discuss-workflow.js";
 import { detectMcpOverrides } from "./services/mcp-config.js";
-import { App } from "@slack/bolt";
+import { App, LogLevel } from "@slack/bolt";
 
 // Init database
 initDatabase(config.databasePath);
@@ -38,6 +40,7 @@ const app = new App({
   appToken: config.slackAppToken,
   signingSecret: config.slackSigningSecret,
   socketMode: true,
+  logLevel: LogLevel.ERROR,
 });
 
 // Schedule daily restart
@@ -153,13 +156,10 @@ startHttpServer(config.port);
   // Resolve all channel names to IDs before registering handlers
   await resolveMonitorChannels(app);
   await resolveDelayChannels(app);
-  await resolveDiscussChannels(app);
-
-  // Register message handlers (checks isDiscussChannel, so must be after resolve)
+  // Register message handlers
   registerHandlers(app, botUserId, config.ownerUserId);
   registerAlertMonitor(app, config.ownerUserId);
   registerDelayAlertMonitor(app, config.ownerUserId);
-  registerDiscussMonitor(app, config.ownerUserId);
 
   scheduleDailyRestart();
   scheduleDailySummary();

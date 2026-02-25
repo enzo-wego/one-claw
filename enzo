@@ -22,7 +22,7 @@ do_start() {
 
   echo "Starting EnzoBot..."
   cd "$DIR"
-  nohup npx tsx src/index.ts >> "$LOG_FILE" 2>&1 &
+  nohup bash start.sh >> "$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
   echo "EnzoBot started (PID $!, log: $LOG_FILE)"
 }
@@ -37,7 +37,7 @@ do_stop() {
   local pid
   pid=$(cat "$PID_FILE")
   echo "Stopping EnzoBot (PID $pid)..."
-  kill "$pid"
+  kill "$pid" 2>/dev/null || true
 
   # Wait up to 10 seconds for graceful shutdown
   for i in $(seq 1 10); do

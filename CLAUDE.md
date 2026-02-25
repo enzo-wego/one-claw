@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-EnzoBot — a Slack bot powered by Claude. Provides DM chat, daily channel summaries, PagerDuty/Airflow alert investigation, and discuss channels that proxy to Claude CLI sessions.
+EnzoBot — a Slack bot powered by Claude. Provides DM chat, daily channel summaries, PagerDuty/Airflow alert investigation, and @mention-triggered persistent CLI sessions in any channel.
 
 ## Tech Stack
 
@@ -20,10 +20,9 @@ src/
   config.ts          — All env var parsing (required() / csvList() / channelList())
   server.ts          — HTTP server: /health, /daily-summary, / (status page)
   handlers/          — Slack message event handlers
-    message.ts       — DM chat (owner-only, session-based)
+    message.ts       — DM one-shot CLI + channel @mention discuss sessions
     alert-monitor.ts — Detects PagerDuty messages, triggers alert workflows
     delay-alert-monitor.ts — Counts Airflow alerts, triggers on threshold
-    discuss-monitor.ts     — Routes discuss channel messages to CLI sessions
   services/          — Business logic
     agent.ts         — Agent SDK query() wrapper for DM chat
     daily-summary.ts — Agent SDK query() with Slack MCP for summaries
@@ -50,16 +49,16 @@ npx tsc --noEmit     # Type check only (no emit, outDir is dist/)
 ## Key Patterns
 
 - **Two AI integration modes:**
-  1. `query()` from `@anthropic-ai/claude-agent-sdk` — used for DM chat (`agent.ts`) and daily summaries (`daily-summary.ts`). Streams async iterator of JSON messages.
-  2. `claude` CLI child process — used for alert investigation and discuss channels (`claude-cli.ts`). Spawns `claude` with `--output-format stream-json` and parses stdout.
+  1. `query()` from `@anthropic-ai/claude-agent-sdk` — used for daily summaries (`daily-summary.ts`). Streams async iterator of JSON messages.
+  2. `claude` CLI child process — used for DM chat, channel @mention sessions, and alert investigation (`claude-cli.ts`). Spawns `claude` with `--output-format stream-json` and parses stdout.
 
 - **Owner-only:** All bot interactions are restricted to `OWNER_USER_ID`. Non-owners get a polite decline.
 
 - **Channel lists:** `channelList()` supports `!` prefix to disable channels (e.g., `alerts,!incidents`). `csvList()` for simple comma-separated lists.
 
-- **Session management:** SQLite tracks DM sessions. `thread_ts` links sessions to Slack threads. `archiveSession()` detaches by nulling `thread_ts`.
+- **DMs:** One-shot Claude CLI — no session tracking, no SQLite.
 
-- **Discuss sessions:** Maintain persistent Claude CLI sessions. Thread replies resume the same session via `--resume <sessionId>`. `!compact` pipes `/compact` to CLI stdin. Context usage is tracked and shown in response footers.
+- **@mention sessions:** `@EnzoBot` in any channel starts a persistent Claude CLI session in that thread. Thread context from other users is fetched and prepended to prompts. `!compact` and `!exit` commands work via @mention. Sessions are tracked in-memory via `discuss-workflow.ts`.
 
 - **Graceful shutdown:** SIGTERM/SIGINT kills all active CLI children, stops Slack, closes HTTP server, closes database.
 

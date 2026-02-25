@@ -7,16 +7,17 @@ import {
   type DiscussCliResult,
 } from "./claude-cli.js";
 
-const SLACK_MAX_LENGTH = 39000;
+const SLACK_MAX_LENGTH = 3900;
 const CONTEXT_WARN_TOKENS = 150_000;
 const CONTEXT_MAX_TOKENS = 200_000;
 
-interface ActiveDiscussion {
+export interface ActiveDiscussion {
   channelId: string;
   threadTs: string;
   cliSessionId: string | null;
   cliChild: ChildProcess | null;
   isProcessing: boolean;
+  lastSeenTs: string | null;
 }
 
 const discussions = new Map<string, ActiveDiscussion>();
@@ -29,17 +30,11 @@ function formatTokens(n: number): string {
 function buildUsageFooter(result: DiscussCliResult): string {
   const parts: string[] = [];
 
+  parts.push(`model: ${config.discussModel}`);
+
   if (result.inputTokens != null) {
     const pct = Math.round((result.inputTokens / CONTEXT_MAX_TOKENS) * 100);
     parts.push(`context: ${formatTokens(result.inputTokens)} (${pct}%)`);
-  }
-
-  if (result.costUsd != null) {
-    parts.push(`cost: $${result.costUsd.toFixed(4)}`);
-  }
-
-  if (result.numTurns != null) {
-    parts.push(`turns: ${result.numTurns}`);
   }
 
   if (parts.length === 0) return "";
@@ -53,9 +48,23 @@ function buildUsageFooter(result: DiscussCliResult): string {
   return footer;
 }
 
-function truncateResponse(text: string): string {
-  if (text.length <= SLACK_MAX_LENGTH) return text;
-  return text.slice(0, SLACK_MAX_LENGTH) + "\n\n... (truncated)";
+function chunkResponse(text: string): string[] {
+  if (text.length <= SLACK_MAX_LENGTH) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= SLACK_MAX_LENGTH) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf("\n\n", SLACK_MAX_LENGTH);
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf("\n", SLACK_MAX_LENGTH);
+    if (splitAt <= 0) splitAt = SLACK_MAX_LENGTH;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
+  }
+  return chunks;
 }
 
 function stripMention(text: string): string {
@@ -111,17 +120,17 @@ async function runDiscussCliWithHeartbeat(
       discussion.cliSessionId = result.sessionId;
     }
 
-    let displayText: string;
+    let fullText: string;
     if (timedOut) {
       const mins = Math.round(config.discussCliTimeoutMs / 60000);
-      displayText = `CLI session timed out after ${mins} minutes. Use \`!exit\` and try again.`;
+      fullText = `CLI session timed out after ${mins} minutes. Use \`!exit\` and try again.`;
       console.log(`[Discuss] CLI timed out for thread ${threadTs} after ${mins}m`);
     } else if (result.exitCode !== 0 && !result.response) {
-      displayText = `CLI exited with error (code: ${result.exitCode}). Use \`!exit\` and try again.`;
+      fullText = `CLI exited with error (code: ${result.exitCode}). Use \`!exit\` and try again.`;
       console.log(`[Discuss] CLI error for thread ${threadTs} (exit: ${result.exitCode})`);
     } else {
       const response = result.response || "No response from Claude CLI.";
-      displayText = truncateResponse(response + buildUsageFooter(result));
+      fullText = response + buildUsageFooter(result);
       console.log(
         `[Discuss] CLI done for thread ${threadTs} ` +
           `(exit: ${result.exitCode}, session: ${result.sessionId || "none"})`
@@ -129,18 +138,33 @@ async function runDiscussCliWithHeartbeat(
     }
 
     try {
+      const chunks = chunkResponse(fullText);
+
+      // First chunk: update the "Thinking..." message or post new
       if (thinkingTs) {
         await app.client.chat.update({
           channel: discussion.channelId,
           ts: thinkingTs,
-          text: displayText,
+          text: chunks[0],
         });
+        discussion.lastSeenTs = thinkingTs;
       } else {
-        await app.client.chat.postMessage({
+        const posted = await app.client.chat.postMessage({
           channel: discussion.channelId,
           thread_ts: threadTs,
-          text: displayText,
+          text: chunks[0],
         });
+        if (posted.ts) discussion.lastSeenTs = posted.ts;
+      }
+
+      // Remaining chunks as thread replies
+      for (let i = 1; i < chunks.length; i++) {
+        const reply = await app.client.chat.postMessage({
+          channel: discussion.channelId,
+          thread_ts: threadTs,
+          text: chunks[i],
+        });
+        if (reply.ts) discussion.lastSeenTs = reply.ts;
       }
     } catch (err) {
       console.error(`[Discuss] Failed to post response:`, err);
@@ -168,6 +192,7 @@ export async function startDiscussSession(
     cliSessionId: null,
     cliChild: null,
     isProcessing: true,
+    lastSeenTs: null,
   };
   discussions.set(messageTs, discussion);
 
@@ -377,6 +402,7 @@ export function getAllDiscussions(): Array<{
   cliSessionId: string | null;
   isProcessing: boolean;
   hasCliChild: boolean;
+  lastSeenTs: string | null;
 }> {
   return Array.from(discussions.entries()).map(([threadTs, d]) => ({
     threadTs,
@@ -384,6 +410,7 @@ export function getAllDiscussions(): Array<{
     cliSessionId: d.cliSessionId,
     isProcessing: d.isProcessing,
     hasCliChild: d.cliChild !== null,
+    lastSeenTs: d.lastSeenTs,
   }));
 }
 

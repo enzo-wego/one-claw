@@ -1,145 +1,106 @@
 import type { App } from "@slack/bolt";
-import {
-  getActiveSession,
-  getSessionById,
-  createSession,
-  archiveSession,
-  activateSession,
-  saveMessage,
-  getMessages,
-} from "../services/database.js";
-import { isProcessing, lock, unlock } from "../services/session.js";
-import { askAgent } from "../services/agent.js";
 import { config } from "../config.js";
-import { isDiscussChannel } from "./discuss-monitor.js";
+import {
+  startDiscussSession,
+  handleDiscussReply,
+  handleDiscussCompact,
+  handleDiscussExit,
+  getActiveDiscussion,
+} from "../services/discuss-workflow.js";
+import { getActiveWorkflow } from "../services/alert-workflow.js";
+import { getActiveDelayWorkflow } from "../services/delay-alert-workflow.js";
+import { spawnDiscussCli } from "../services/claude-cli.js";
 
 function stripMention(text: string): string {
   return text.replace(/<@[A-Z0-9]+>/g, "").trim();
 }
 
-async function handleCommand(
+/**
+ * Fetch thread messages since lastSeenTs, formatted as context for Claude.
+ * Returns non-bot messages as "<@user>: text" lines.
+ */
+async function fetchThreadContext(
   app: App,
   channelId: string,
-  sessionKey: string,
-  text: string,
-  replyThreadTs?: string
-): Promise<boolean> {
-  const threadOpts = replyThreadTs ? { thread_ts: replyThreadTs } : {};
-  const lower = text.toLowerCase();
-
-  if (lower === "!new") {
-    archiveSession(sessionKey);
-    await app.client.chat.postMessage({
+  threadTs: string,
+  lastSeenTs: string | null,
+  botUserId: string
+): Promise<string> {
+  try {
+    const res = await app.client.conversations.replies({
       channel: channelId,
-      ...threadOpts,
-      text: "Session archived. Send a message to start a new conversation.",
+      ts: threadTs,
+      oldest: lastSeenTs || undefined,
     });
-    return true;
-  }
 
-  if (lower.startsWith("!resume ")) {
-    const targetId = text.slice(8).trim();
-    const target = getSessionById(targetId);
-    if (!target) {
-      await app.client.chat.postMessage({
-        channel: channelId,
-        ...threadOpts,
-        text: `Session \`${targetId}\` not found.`,
-      });
-      return true;
-    }
-    if (target.thread_ts) {
-      await app.client.chat.postMessage({
-        channel: channelId,
-        ...threadOpts,
-        text: `Session \`${targetId}\` is already active.`,
-      });
-      return true;
-    }
-    // Archive current, activate target
-    archiveSession(sessionKey);
-    activateSession(targetId, sessionKey);
-    const msgs = getMessages(targetId);
-    await app.client.chat.postMessage({
-      channel: channelId,
-      ...threadOpts,
-      text: `Resumed session \`${targetId}\` (${msgs.length} messages). Continue the conversation.`,
-    });
-    return true;
-  }
+    const messages = (res.messages || [])
+      .filter((m) => {
+        if (m.bot_id || m.user === botUserId) return false;
+        if (m.ts === threadTs && !lastSeenTs) return false; // skip root if starting fresh
+        if (lastSeenTs && m.ts && m.ts <= lastSeenTs) return false;
+        return true;
+      })
+      .map((m) => `<@${m.user}>: ${m.text || ""}`.trim());
 
-  return false;
+    if (messages.length === 0) return "";
+    return "Thread context (messages from other users):\n" + messages.join("\n") + "\n\n";
+  } catch (err) {
+    console.error("[Message] Failed to fetch thread context:", err);
+    return "";
+  }
 }
 
-async function handleMessage(
+/**
+ * Handle one-shot DM: spawn CLI, wait for result, post response.
+ */
+async function handleDm(
   app: App,
   channelId: string,
-  sessionKey: string,
-  messageTs: string,
-  userId: string,
-  rawText: string,
-  replyThreadTs?: string
+  text: string
 ): Promise<void> {
-  const text = stripMention(rawText);
-  if (!text) return;
+  const cleanText = stripMention(text);
+  if (!cleanText) return;
 
-  const threadOpts = replyThreadTs ? { thread_ts: replyThreadTs } : {};
-
-  // Handle commands
-  if (await handleCommand(app, channelId, sessionKey, text, replyThreadTs)) return;
-
-  // Check processing lock
-  if (isProcessing(sessionKey)) {
-    await app.client.chat.postMessage({
+  let thinkingTs: string | undefined;
+  try {
+    const res = await app.client.chat.postMessage({
       channel: channelId,
-      ...threadOpts,
-      text: "Still thinking on your previous message... hang tight.",
+      text: "Thinking...",
     });
-    return;
+    thinkingTs = res.ts || undefined;
+  } catch (err) {
+    console.error("[Message] Failed to post thinking indicator:", err);
   }
-
-  // Ensure session exists, lock it
-  let session = getActiveSession(sessionKey);
-  if (!session) {
-    session = createSession(sessionKey, channelId, userId);
-  }
-  lock(session.session_id);
-
-  // Post thinking indicator
-  const thinking = await app.client.chat.postMessage({
-    channel: channelId,
-    ...threadOpts,
-    text: "Thinking...",
-  });
 
   try {
-    // Save user message
-    saveMessage(session.session_id, messageTs, userId, "user", text);
+    const { done } = spawnDiscussCli(cleanText, config.paymentsRepoPath, {
+      model: config.discussModel,
+    });
+    const result = await done;
 
-    const history = getMessages(session.session_id);
-    const response = await askAgent(text, history, config.agentModel);
+    const response = result.response || "No response from Claude CLI.";
 
-    // Update thinking indicator with actual response
-    if (thinking.ts) {
+    if (thinkingTs) {
       await app.client.chat.update({
         channel: channelId,
-        ts: thinking.ts,
+        ts: thinkingTs,
         text: response,
       });
-      saveMessage(session.session_id, thinking.ts, "bot", "assistant", response);
+    } else {
+      await app.client.chat.postMessage({
+        channel: channelId,
+        text: response,
+      });
     }
   } catch (err) {
-    console.error("Error handling message:", err);
-
-    if (thinking.ts) {
+    console.error("[Message] DM CLI error:", err);
+    if (thinkingTs) {
       await app.client.chat.update({
         channel: channelId,
-        ts: thinking.ts,
+        ts: thinkingTs,
         text: "Sorry, something went wrong. Please try again.",
       }).catch(() => {});
     }
-  } finally {
-    unlock(session.session_id);
   }
 }
 
@@ -149,11 +110,21 @@ export function registerHandlers(
   ownerUserId: string
 ): void {
   app.message(async ({ message }) => {
-    const msg = message as Record<string, any>;
+    const raw = message as Record<string, any>;
 
-    // Ignore bot's own messages, subtypes (edits, joins, etc.)
+    // Support edited messages (subtype: message_changed)
+    const isEdit = raw.subtype === "message_changed";
+    const msg = isEdit ? { ...raw, ...raw.message, channel: raw.channel, channel_type: raw.channel_type } : raw;
+
+    // Ignore bot messages and other subtypes (joins, etc.)
     if (msg.bot_id || msg.user === botUserId) return;
-    if (msg.subtype) return;
+    if (raw.subtype && !isEdit) return;
+
+    // Skip edits for messages that already have an active discuss session
+    if (isEdit) {
+      const editThreadTs = (msg.thread_ts || msg.ts) as string;
+      if (getActiveDiscussion(editThreadTs)) return;
+    }
 
     const isDm = msg.channel_type === "im";
     const text: string = msg.text || "";
@@ -174,16 +145,53 @@ export function registerHandlers(
       return;
     }
 
-    // Skip discuss channels — handled by discuss-monitor
-    if (!isDm && isDiscussChannel(msg.channel)) return;
-
-    // Owner: always respond in DMs, only on @mention in channels
+    // Owner + DM → one-shot Claude CLI
     if (isDm) {
-      const replyThreadTs = msg.thread_ts as string | undefined;
-      await handleMessage(app, msg.channel, msg.channel, msg.ts, userId, text, replyThreadTs);
-    } else if (hasMention) {
-      const threadTs = (msg.thread_ts || msg.ts) as string;
-      await handleMessage(app, msg.channel, threadTs, msg.ts, userId, text, threadTs);
+      await handleDm(app, msg.channel, text);
+      return;
     }
+
+    // Owner + channel — only respond to @mentions
+    if (!hasMention) return;
+
+    const threadTs = (msg.thread_ts || msg.ts) as string;
+    const cleanText = stripMention(text);
+    if (!cleanText) return;
+
+    // Skip if thread has active alert or delay-alert workflow
+    if (getActiveWorkflow(threadTs) || getActiveDelayWorkflow(threadTs)) return;
+
+    // Handle discuss commands
+    const cmd = cleanText.toLowerCase();
+    const activeDiscussion = getActiveDiscussion(threadTs);
+
+    if (cmd === "!compact" && activeDiscussion) {
+      await handleDiscussCompact(app, threadTs);
+      return;
+    }
+
+    if (cmd === "!exit" && activeDiscussion) {
+      await handleDiscussExit(app, threadTs);
+      return;
+    }
+
+    // Active discussion → follow-up with thread context
+    if (activeDiscussion) {
+      const context = await fetchThreadContext(
+        app,
+        msg.channel,
+        threadTs,
+        activeDiscussion.lastSeenTs,
+        botUserId
+      );
+      const prompt = context + cleanText;
+      await handleDiscussReply(app, threadTs, prompt);
+      return;
+    }
+
+    // No active session → start new discuss session with thread context
+    const context = await fetchThreadContext(app, msg.channel, threadTs, null, botUserId);
+    const prompt = context + cleanText;
+    await startDiscussSession(app, msg.channel, threadTs, prompt);
   });
 }

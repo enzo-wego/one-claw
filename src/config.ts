@@ -44,7 +44,6 @@ export const config = {
     dailySummary: csvList("DAILY_SUMMARY_CHANNELS"),
     monitor: channelList("MONITOR_CHANNELS"),
     monitorDelay: channelList("MONITOR_DELAY_CHANNELS"),
-    discuss: csvList("DISCUSS_CHANNELS"),
   },
 
   // Daily summary settings
@@ -92,6 +91,6 @@ export const config = {
   // MCP servers required by alert skills (auto-detected from ~/.claude.json)
   requiredMcpServers: csvList("REQUIRED_MCP_SERVERS").length > 0
     ? csvList("REQUIRED_MCP_SERVERS")
-    : ["chrome-devtools", "athena"],
+    : ["chrome-devtools", "athena", "atlassian", "slack"],
   claudeConfigPath: process.env.CLAUDE_CONFIG_PATH || path.join(os.homedir(), ".claude.json"),
 };

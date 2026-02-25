@@ -1,5 +1,4 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { getActiveSessionCount, getTotalSessionCount } from "./services/database.js";
 import { getAllDiscussions, killDiscussSession } from "./services/discuss-workflow.js";
 import { getAllAlertWorkflows, killAlertWorkflow } from "./services/alert-workflow.js";
 import { getAllDelayWorkflows, killDelayWorkflow } from "./services/delay-alert-workflow.js";
@@ -29,7 +28,7 @@ function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
     status: "ok",
     uptime: uptime(),
     slack_connected: slackConnected,
-    active_sessions: getActiveSessionCount(),
+    active_sessions: getAllDiscussions().length,
   };
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
@@ -64,12 +63,10 @@ function handleIndex(_req: IncomingMessage, res: ServerResponse): void {
   <p><span class="status ${slackConnected ? "ok" : "err"}"></span>${slackConnected ? "Connected" : "Disconnected"}</p>
   <dl>
     <dt>Uptime</dt><dd>${uptime()}</dd>
-    <dt>CLI Processes</dt>
-    <dd>${cliRunning} running / ${cliTotal} sessions
+    <dt>CLI Sessions</dt>
+    <dd>${cliRunning} running / ${cliTotal} total
       <span class="sub">(${discuss.length} discuss, ${alert.length} alert, ${delayAlert.length} delay)</span>
     </dd>
-    <dt>DM Chat</dt>
-    <dd>${getActiveSessionCount()} active / ${getTotalSessionCount()} total</dd>
   </dl>
   <p><a href="/sessions">Session details (JSON)</a> · <a href="/api-docs">API docs</a></p>
 </body>

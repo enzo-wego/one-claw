@@ -1,6 +1,6 @@
 # EnzoBot
 
-A Slack bot powered by Claude that provides DM chat, daily channel summaries, PagerDuty alert investigation, Airflow delay monitoring, and interactive discuss channels.
+A Slack bot powered by Claude that provides DM chat, daily channel summaries, PagerDuty alert investigation, Airflow delay monitoring, and @mention-triggered persistent CLI sessions in any channel.
 
 ## Prerequisites
 
@@ -65,11 +65,7 @@ Runs the bot in a loop, restarting automatically on exit (useful for supervised 
 
 ### 1. DM Chat
 
-DM the bot to have a conversation with Claude. Only the configured `OWNER_USER_ID` gets responses. Sessions are tracked per-thread with conversation history stored in SQLite.
-
-**Commands (in DM):**
-- `!new` — Archive current session, start fresh
-- `!resume <session_id>` — Resume a previous session
+DM the bot for a one-shot Claude CLI response. Only the configured `OWNER_USER_ID` gets responses. No session tracking — each message is independent.
 
 ### 2. Daily Summary
 
@@ -100,15 +96,15 @@ Watches channels for Airflow task delay alerts. Counts occurrences within a time
 
 Configure: `MONITOR_DELAY_CHANNELS`, `DELAY_ALERT_TASK_PATTERNS`, `DELAY_ALERT_THRESHOLD`
 
-### 5. Discuss Channels
+### 5. @Mention Sessions
 
-Designate channels where owner messages are proxied to persistent Claude CLI sessions. Each top-level message starts a new session; thread replies continue it.
+`@EnzoBot` in any channel starts a persistent Claude CLI session in that thread. Thread replies with @mention continue the session. Thread context from other users is automatically fetched and included.
 
-**Thread commands:**
-- `!compact` — Compact the CLI session context when it gets large
-- `!exit` — End the session
+**Thread commands (via @mention):**
+- `@EnzoBot !compact` — Compact the CLI session context when it gets large
+- `@EnzoBot !exit` — End the session
 
-Configure: `DISCUSS_CHANNELS`, `DISCUSS_MODEL`
+Configure: `DISCUSS_MODEL`
 
 ## HTTP Endpoints
 
@@ -130,7 +126,7 @@ All configuration is via environment variables (`.env` file). See `.env.example`
 | `OWNER_USER_ID`             | Yes      | —                              | Slack user ID of the bot owner                   |
 | `DATABASE_PATH`             | No       | `./data/bot.db`                | SQLite database path                             |
 | `PORT`                      | No       | `3000`                         | HTTP server port                                 |
-| `AGENT_MODEL`               | No       | `sonnet`                       | Claude model for DM chat                         |
+| `AGENT_MODEL`               | No       | `sonnet`                       | Claude model for daily summaries                 |
 | `DAILY_RESTART_HOUR`        | No       | `23`                           | Hour (0-23) to auto-restart                      |
 | `DAILY_SUMMARY_CHANNELS`    | No       | —                              | Comma-separated channel names                    |
 | `DAILY_SUMMARY_TIME`        | No       | `07:00`                        | Schedule time (HH:MM, local)                     |
@@ -145,8 +141,7 @@ All configuration is via environment variables (`.env` file). See `.env.example`
 | `DELAY_ALERT_THRESHOLD`     | No       | `3`                            | Alert count before triggering                    |
 | `DELAY_ALERT_WINDOW_MS`     | No       | `3600000`                      | Time window (ms)                                 |
 | `DELAY_ALERT_SKILL`         | No       | `one:pay-ops-tax-production`   | Skill for delay alerts                           |
-| `DISCUSS_CHANNELS`          | No       | —                              | Discuss channel names (CSV)                      |
-| `DISCUSS_MODEL`             | No       | `claude-sonnet-4-5-20250929`   | Model for discuss sessions                       |
+| `DISCUSS_MODEL`             | No       | `claude-sonnet-4-5-20250929`   | Model for DM and @mention CLI sessions           |
 | `PAYMENTS_REPO_PATH`        | No       | `~/go/src/github.com/payments` | Working directory for CLI processes              |
 | `REQUIRED_MCP_SERVERS`      | No       | `chrome-devtools,athena`       | MCP servers to force-enable                      |
 
@@ -158,10 +153,9 @@ src/
   config.ts             # Environment variable parsing
   server.ts             # HTTP server (health, daily summary trigger)
   handlers/
-    message.ts          # DM chat handler (owner-only, session management)
+    message.ts          # DM one-shot CLI + channel @mention discuss sessions
     alert-monitor.ts    # PagerDuty message detection + workflow trigger
     delay-alert-monitor.ts  # Airflow task alert counting + threshold trigger
-    discuss-monitor.ts  # Discuss channel routing + thread commands
   services/
     agent.ts            # Claude Agent SDK wrapper for DM chat
     daily-summary.ts    # Daily summary via Agent SDK + Slack MCP
@@ -177,6 +171,6 @@ src/
 
 ## Data
 
-- **SQLite database:** `./data/bot.db` (sessions and message history)
+- **SQLite database:** `./data/bot.db` (daily summary data)
 - **Logs:** `./data/enzo.log` (when running via `./enzo start`)
 - **PID file:** `.enzo.pid` (managed by `./enzo`)
