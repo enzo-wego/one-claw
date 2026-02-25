@@ -56,6 +56,8 @@ export const config = {
 
   // Discuss channel model
   discussModel: process.env.DISCUSS_MODEL || "claude-sonnet-4-5-20250929",
+  discussCliTimeoutMs: parseInt(process.env.DISCUSS_CLI_TIMEOUT_MS || "600000", 10),
+  discussHeartbeatIntervalMs: parseInt(process.env.DISCUSS_HEARTBEAT_INTERVAL_MS || "30000", 10),
 
   // PagerDuty
   pagerdutyApiToken: process.env.PAGERDUTY_API_TOKEN || "",

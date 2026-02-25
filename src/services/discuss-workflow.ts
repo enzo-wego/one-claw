@@ -62,6 +62,95 @@ function stripMention(text: string): string {
   return text.replace(/<@[A-Z0-9]+>/g, "").trim();
 }
 
+function formatElapsed(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (min === 0) return `${sec}s`;
+  return `${min}m ${sec}s`;
+}
+
+async function runDiscussCliWithHeartbeat(
+  app: App,
+  discussion: ActiveDiscussion,
+  threadTs: string,
+  thinkingTs: string | undefined,
+  child: ChildProcess,
+  done: Promise<DiscussCliResult>
+): Promise<void> {
+  const startTime = Date.now();
+
+  // Heartbeat: update "Thinking..." with elapsed time
+  const heartbeatInterval = thinkingTs
+    ? setInterval(async () => {
+        const elapsed = formatElapsed(Date.now() - startTime);
+        try {
+          await app.client.chat.update({
+            channel: discussion.channelId,
+            ts: thinkingTs,
+            text: `Thinking... (${elapsed})`,
+          });
+        } catch {}
+      }, config.discussHeartbeatIntervalMs)
+    : null;
+
+  // Timeout: kill CLI if it runs too long
+  let timedOut = false;
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGTERM");
+  }, config.discussCliTimeoutMs);
+
+  try {
+    const result = await done;
+
+    discussion.cliChild = null;
+    discussion.isProcessing = false;
+
+    if (result.sessionId) {
+      discussion.cliSessionId = result.sessionId;
+    }
+
+    let displayText: string;
+    if (timedOut) {
+      const mins = Math.round(config.discussCliTimeoutMs / 60000);
+      displayText = `CLI session timed out after ${mins} minutes. Use \`!exit\` and try again.`;
+      console.log(`[Discuss] CLI timed out for thread ${threadTs} after ${mins}m`);
+    } else if (result.exitCode !== 0 && !result.response) {
+      displayText = `CLI exited with error (code: ${result.exitCode}). Use \`!exit\` and try again.`;
+      console.log(`[Discuss] CLI error for thread ${threadTs} (exit: ${result.exitCode})`);
+    } else {
+      const response = result.response || "No response from Claude CLI.";
+      displayText = truncateResponse(response + buildUsageFooter(result));
+      console.log(
+        `[Discuss] CLI done for thread ${threadTs} ` +
+          `(exit: ${result.exitCode}, session: ${result.sessionId || "none"})`
+      );
+    }
+
+    try {
+      if (thinkingTs) {
+        await app.client.chat.update({
+          channel: discussion.channelId,
+          ts: thinkingTs,
+          text: displayText,
+        });
+      } else {
+        await app.client.chat.postMessage({
+          channel: discussion.channelId,
+          thread_ts: threadTs,
+          text: displayText,
+        });
+      }
+    } catch (err) {
+      console.error(`[Discuss] Failed to post response:`, err);
+    }
+  } finally {
+    clearTimeout(timeoutTimer);
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+  }
+}
+
 export async function startDiscussSession(
   app: App,
   channelId: string,
@@ -101,40 +190,8 @@ export async function startDiscussSession(
   });
   discussion.cliChild = child;
 
-  done.then(async (result) => {
-    discussion.cliChild = null;
-    discussion.isProcessing = false;
-
-    if (result.sessionId) {
-      discussion.cliSessionId = result.sessionId;
-    }
-
-    const response = result.response || "No response from Claude CLI.";
-    const displayText = truncateResponse(response + buildUsageFooter(result));
-
-    console.log(
-      `[Discuss] CLI done for thread ${messageTs} ` +
-        `(exit: ${result.exitCode}, session: ${result.sessionId || "none"})`
-    );
-
-    try {
-      if (thinkingTs) {
-        await app.client.chat.update({
-          channel: channelId,
-          ts: thinkingTs,
-          text: displayText,
-        });
-      } else {
-        await app.client.chat.postMessage({
-          channel: channelId,
-          thread_ts: messageTs,
-          text: displayText,
-        });
-      }
-    } catch (err) {
-      console.error(`[Discuss] Failed to post response:`, err);
-    }
-  });
+  // Fire-and-forget: heartbeat + timeout + response handling
+  runDiscussCliWithHeartbeat(app, discussion, messageTs, thinkingTs, child, done);
 }
 
 export async function handleDiscussReply(
@@ -190,39 +247,8 @@ export async function handleDiscussReply(
   });
   discussion.cliChild = child;
 
-  done.then(async (result) => {
-    discussion.cliChild = null;
-    discussion.isProcessing = false;
-
-    if (result.sessionId) {
-      discussion.cliSessionId = result.sessionId;
-    }
-
-    const response = result.response || "No response from Claude CLI.";
-    const displayText = truncateResponse(response + buildUsageFooter(result));
-
-    console.log(
-      `[Discuss] Follow-up CLI done for thread ${threadTs} (exit: ${result.exitCode})`
-    );
-
-    try {
-      if (thinkingTs) {
-        await app.client.chat.update({
-          channel: discussion.channelId,
-          ts: thinkingTs,
-          text: displayText,
-        });
-      } else {
-        await app.client.chat.postMessage({
-          channel: discussion.channelId,
-          thread_ts: threadTs,
-          text: displayText,
-        });
-      }
-    } catch (err) {
-      console.error(`[Discuss] Failed to post follow-up response:`, err);
-    }
-  });
+  // Fire-and-forget: heartbeat + timeout + response handling
+  runDiscussCliWithHeartbeat(app, discussion, threadTs, thinkingTs, child, done);
 }
 
 export async function handleDiscussCompact(
