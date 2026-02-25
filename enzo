@@ -1,0 +1,93 @@
+#!/bin/bash
+# EnzoBot service manager
+# Usage: ./enzo start|stop|restart|status|logs
+
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PID_FILE="$DIR/.enzo.pid"
+LOG_FILE="$DIR/data/enzo.log"
+
+mkdir -p "$DIR/data"
+
+is_running() {
+  [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+do_start() {
+  if is_running; then
+    echo "EnzoBot is already running (PID $(cat "$PID_FILE"))"
+    return 1
+  fi
+
+  echo "Starting EnzoBot..."
+  cd "$DIR"
+  nohup npx tsx src/index.ts >> "$LOG_FILE" 2>&1 &
+  echo $! > "$PID_FILE"
+  echo "EnzoBot started (PID $!, log: $LOG_FILE)"
+}
+
+do_stop() {
+  if ! is_running; then
+    echo "EnzoBot is not running"
+    rm -f "$PID_FILE"
+    return 0
+  fi
+
+  local pid
+  pid=$(cat "$PID_FILE")
+  echo "Stopping EnzoBot (PID $pid)..."
+  kill "$pid"
+
+  # Wait up to 10 seconds for graceful shutdown
+  for i in $(seq 1 10); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "EnzoBot stopped."
+      rm -f "$PID_FILE"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Force killing..."
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+  echo "EnzoBot killed."
+}
+
+do_status() {
+  if is_running; then
+    local pid
+    pid=$(cat "$PID_FILE")
+    echo "EnzoBot is running (PID $pid)"
+    # Show health if HTTP is up
+    curl -s "http://localhost:${PORT:-3000}/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || true
+  else
+    echo "EnzoBot is not running"
+    rm -f "$PID_FILE"
+    return 1
+  fi
+}
+
+case "${1:-}" in
+  start)
+    do_start
+    ;;
+  stop)
+    do_stop
+    ;;
+  restart)
+    do_stop
+    do_start
+    ;;
+  status)
+    do_status
+    ;;
+  logs)
+    tail -f "$LOG_FILE"
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|status|logs}"
+    exit 1
+    ;;
+esac

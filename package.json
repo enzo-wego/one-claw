@@ -1,0 +1,26 @@
+{
+  "name": "one-claw",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "./enzo start",
+    "stop": "./enzo stop",
+    "restart": "./enzo restart",
+    "status": "./enzo status",
+    "logs": "./enzo logs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.50",
+    "@slack/bolt": "^4.1.0",
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.7.0"
+  }
+}

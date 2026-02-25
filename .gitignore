@@ -1,3 +1,6 @@
+# SQLite data
+data/
+
 # Logs
 logs
 *.log
@@ -12,6 +15,7 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 # Runtime data
 pids
 *.pid
+.enzo.pid
 *.seed
 *.pid.lock
 
@@ -137,3 +141,6 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+/.claude/settings.local.json
+/.serena
+/.idea
