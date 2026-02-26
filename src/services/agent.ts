@@ -22,6 +22,9 @@ export async function askAgent(
       model: model as "sonnet" | "haiku" | "opus",
       permissionMode: "bypassPermissions",
       maxTurns: 50,
+      stderr: (data: string) => {
+        console.error(`[Agent] [stderr]: ${data.trimEnd()}`);
+      },
     },
   })) {
     const msg = message as Record<string, unknown>;

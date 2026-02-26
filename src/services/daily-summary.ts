@@ -41,6 +41,9 @@ IMPORTANT: Do NOT send any Slack messages. Do NOT use any Slack send/post/schedu
       allowDangerouslySkipPermissions: true,
       maxTurns: 50,
       settingSources: ['user', 'project', 'local'],
+      stderr: (data: string) => {
+        console.error(`[DailySummary] [stderr] #${channel}: ${data.trimEnd()}`);
+      },
       allowedTools: [
         "mcp__claude_ai_Slack__slack_read_channel",
         "mcp__claude_ai_Slack__slack_read_thread",
