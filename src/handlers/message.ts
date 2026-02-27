@@ -10,9 +10,22 @@ import {
 import { getActiveWorkflow } from "../services/alert-workflow.js";
 import { getActiveDelayWorkflow } from "../services/delay-alert-workflow.js";
 import { spawnDiscussCli } from "../services/claude-cli.js";
+import {
+  downloadSlackFiles,
+  buildFilePromptPrefix,
+  type SlackFile,
+} from "../services/slack-files.js";
 
 function stripMention(text: string): string {
   return text.replace(/<@[A-Z0-9]+>/g, "").trim();
+}
+
+async function extractFilePrefix(
+  files: SlackFile[] | undefined
+): Promise<string> {
+  if (!files || files.length === 0) return "";
+  const paths = await downloadSlackFiles(files, config.slackBotToken);
+  return buildFilePromptPrefix(paths);
 }
 
 /**
@@ -56,10 +69,12 @@ async function fetchThreadContext(
 async function handleDm(
   app: App,
   channelId: string,
-  text: string
+  text: string,
+  files?: SlackFile[]
 ): Promise<void> {
+  const filePrefix = await extractFilePrefix(files);
   const cleanText = stripMention(text);
-  if (!cleanText) return;
+  if (!cleanText && !filePrefix) return;
 
   let thinkingTs: string | undefined;
   try {
@@ -73,7 +88,8 @@ async function handleDm(
   }
 
   try {
-    const { done } = spawnDiscussCli(cleanText, config.paymentsRepoPath, {
+    const prompt = filePrefix + cleanText;
+    const { done } = spawnDiscussCli(prompt, config.paymentsRepoPath, {
       model: config.discussModel,
     });
     const result = await done;
@@ -147,7 +163,7 @@ export function registerHandlers(
 
     // Owner + DM → one-shot Claude CLI
     if (isDm) {
-      await handleDm(app, msg.channel, text);
+      await handleDm(app, msg.channel, text, msg.files as SlackFile[] | undefined);
       return;
     }
 
@@ -175,6 +191,8 @@ export function registerHandlers(
       return;
     }
 
+    const filePrefix = await extractFilePrefix(msg.files as SlackFile[] | undefined);
+
     // Active discussion → follow-up with thread context
     if (activeDiscussion) {
       const context = await fetchThreadContext(
@@ -184,14 +202,14 @@ export function registerHandlers(
         activeDiscussion.lastSeenTs,
         botUserId
       );
-      const prompt = context + cleanText;
+      const prompt = filePrefix + context + cleanText;
       await handleDiscussReply(app, threadTs, prompt);
       return;
     }
 
     // No active session → start new discuss session with thread context
     const context = await fetchThreadContext(app, msg.channel, threadTs, null, botUserId);
-    const prompt = context + cleanText;
+    const prompt = filePrefix + context + cleanText;
     await startDiscussSession(app, msg.channel, threadTs, prompt);
   });
 }

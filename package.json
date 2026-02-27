@@ -12,7 +12,7 @@
     "logs": "./enzo logs"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.56",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.61",
     "@slack/bolt": "^4.1.0",
     "better-sqlite3": "^11.0.0",
     "dotenv": "^16.4.0"

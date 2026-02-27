@@ -1,4 +1,5 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { config } from "../config.js";
+import { spawnDiscussCli } from "./claude-cli.js";
 
 export interface DailySummaryOptions {
   channels: string[];
@@ -31,58 +32,18 @@ IMPORTANT: Do NOT send any Slack messages. Do NOT use any Slack send/post/schedu
 
   console.log(`[DailySummary] Summarizing #${channel}`);
 
-  let text = "";
+  const { done } = spawnDiscussCli(prompt, config.paymentsRepoPath, { model });
+  const result = await done;
 
-  for await (const message of query({
-    prompt,
-    options: {
-      model: model as "sonnet" | "haiku" | "opus",
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      maxTurns: 50,
-      settingSources: ['user', 'project', 'local'],
-      stderr: (data: string) => {
-        console.error(`[DailySummary] [stderr] #${channel}: ${data.trimEnd()}`);
-      },
-      allowedTools: [
-        "mcp__claude_ai_Slack__slack_read_channel",
-        "mcp__claude_ai_Slack__slack_read_thread",
-        "mcp__claude_ai_Slack__slack_read_canvas",
-        "mcp__claude_ai_Slack__slack_read_user_profile",
-        "mcp__claude_ai_Slack__slack_search_public",
-        "mcp__claude_ai_Slack__slack_search_public_and_private",
-        "mcp__claude_ai_Slack__slack_search_channels",
-        "mcp__claude_ai_Slack__slack_search_users",
-      ],
-    },
-  })) {
-    const msg = message as Record<string, unknown>;
-    if (msg.type === "assistant") {
-      const message = msg.message as Record<string, unknown> | undefined;
-      const content = message?.content as Array<Record<string, unknown>> | undefined;
-      if (content) {
-        for (const block of content) {
-          if (block.type === "text" && typeof block.text === "string") {
-            text += block.text;
-          }
-        }
-      }
-    }
-    if (msg.type === "result") {
-      const resultText = msg.result as string | undefined;
-      if (resultText) {
-        text = resultText;
-      }
-      const cost = msg.total_cost_usd as number | undefined;
-      console.log(
-        `[DailySummary] #${channel} done. Cost: $${cost?.toFixed(4) ?? "unknown"}`
-      );
-    }
+  if (result.costUsd !== undefined) {
+    console.log(
+      `[DailySummary] #${channel} done. Cost: $${result.costUsd.toFixed(4)}`
+    );
   }
 
-  if (text) {
+  if (result.response) {
     console.log(`[DailySummary] Summary ready for #${channel}`);
-    return text;
+    return result.response;
   }
 
   console.warn(`[DailySummary] No summary text produced for #${channel}`);
