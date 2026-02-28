@@ -34,6 +34,7 @@ src/
     session.ts       — In-memory processing locks
     pagerduty.ts     — PD incident acknowledgement HTTP API
     mcp-config.ts    — Detects disabled MCP servers, writes override JSON
+    gemini.ts        — Gemini API client with Google Search grounding
 ```
 
 ## Build & Run
@@ -48,9 +49,10 @@ npx tsc --noEmit     # Type check only (no emit, outDir is dist/)
 
 ## Key Patterns
 
-- **Two AI integration modes:**
+- **Three AI integration modes:**
   1. `query()` from `@anthropic-ai/claude-agent-sdk` — used for daily summaries (`daily-summary.ts`). Streams async iterator of JSON messages.
   2. `claude` CLI child process — used for DM chat, channel @mention sessions, and alert investigation (`claude-cli.ts`). Spawns `claude` with `--output-format stream-json` and parses stdout.
+  3. Gemini API (`gemini.ts`) — used for Google Search grounding via `@EnzoBot use gemini ...`. Direct REST API calls with retry logic. Responses stored in-memory per thread and carried over as context when switching back to Claude via `use claude code`.
 
 - **Owner-only:** All bot interactions are restricted to `OWNER_USER_ID`. Non-owners get a polite decline.
 
@@ -59,6 +61,8 @@ npx tsc --noEmit     # Type check only (no emit, outDir is dist/)
 - **DMs:** One-shot Claude CLI — no session tracking, no SQLite.
 
 - **@mention sessions:** `@EnzoBot` in any channel starts a persistent Claude CLI session in that thread. Thread context from other users is fetched and prepended to prompts. `!compact` and `!exit` commands work via @mention. Sessions are tracked in-memory via `discuss-workflow.ts`.
+
+- **Gemini routing:** `@EnzoBot use gemini <query>` routes to Gemini API with Google Search grounding. Supports model selection (`use gemini pro`, `use gemini 2.5 pro`, etc.). `@EnzoBot use claude code` switches back to Claude CLI with Gemini responses carried as context.
 
 - **Graceful shutdown:** SIGTERM/SIGINT kills all active CLI children, stops Slack, closes HTTP server, closes database.
 

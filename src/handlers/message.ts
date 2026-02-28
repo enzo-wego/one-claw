@@ -15,6 +15,66 @@ import {
   buildFilePromptPrefix,
   type SlackFile,
 } from "../services/slack-files.js";
+import { queryGemini } from "../services/gemini.js";
+
+// Gemini thread history: threadTs → list of Gemini responses
+const geminiThreadHistory = new Map<string, string[]>();
+
+function detectGeminiRequest(text: string): boolean {
+  return /\buse\s+gemini\b/i.test(text);
+}
+
+const GEMINI_MODEL_MAP: [RegExp, string][] = [
+  [/^pro\b/i, "gemini-3.1-pro"],
+  [/^3\s*flash\b/i, "gemini-3-flash"],
+  [/^2\.?5\s*pro\b/i, "gemini-2.5-pro"],
+  [/^2\.?5\s*flash\b/i, "gemini-2.5-flash"],
+];
+
+function parseGeminiModel(text: string): { model: string; rest: string } {
+  // Get everything after "use gemini"
+  const afterGemini = text.replace(/^.*?\buse\s+gemini\s*/i, "");
+
+  for (const [pattern, model] of GEMINI_MODEL_MAP) {
+    const match = afterGemini.match(pattern);
+    if (match) {
+      const rest = afterGemini.slice(match[0].length).replace(/^\s+/, "");
+      return { model, rest };
+    }
+  }
+
+  return { model: "gemini-2.5-flash", rest: afterGemini };
+}
+
+function extractGeminiQuery(text: string): string {
+  const { rest } = parseGeminiModel(text);
+  // Strip leading "to " connector (e.g. "use gemini to check..." → "check...")
+  return rest.replace(/^to\s+/i, "").trim();
+}
+
+function detectClaudeCodeResume(text: string): boolean {
+  return /\buse\s+claude(?:\s+code)?\b/i.test(text);
+}
+
+function buildGeminiContext(threadTs: string): string {
+  const responses = geminiThreadHistory.get(threadTs);
+  if (!responses || responses.length === 0) return "";
+  return "Previous Gemini analysis:\n" + responses.join("\n---\n") + "\n\n";
+}
+
+function formatGeminiResponse(result: { text: string; sources: { title: string; url: string }[] }, model: string): string {
+  let msg = `*Gemini (${model}):*\n${result.text}`;
+  if (result.sources.length > 0) {
+    msg += "\n\n*Sources:*\n";
+    const seen = new Set<string>();
+    for (const s of result.sources) {
+      if (seen.has(s.url)) continue;
+      seen.add(s.url);
+      msg += `• <${s.url}|${s.title}>\n`;
+    }
+  }
+  return msg;
+}
 
 function stripMention(text: string): string {
   return text.replace(/<@[A-Z0-9]+>/g, "").trim();
@@ -178,6 +238,83 @@ export function registerHandlers(
 
     // Skip if thread has active alert or delay-alert workflow
     if (getActiveWorkflow(threadTs) || getActiveDelayWorkflow(threadTs)) return;
+
+    // Gemini routing: "use gemini ..."
+    if (detectGeminiRequest(cleanText)) {
+      if (!config.geminiApiKey) {
+        await app.client.chat.postMessage({
+          channel: msg.channel,
+          thread_ts: threadTs,
+          text: "Gemini API key is not configured. Please add `GEMINI_API_KEY` to .env or use Claude instead.",
+        });
+        return;
+      }
+
+      const { model } = parseGeminiModel(cleanText);
+      const query = extractGeminiQuery(cleanText);
+      if (!query) return;
+
+      let indicatorTs: string | undefined;
+      try {
+        const res = await app.client.chat.postMessage({
+          channel: msg.channel,
+          thread_ts: threadTs,
+          text: `Checking with Gemini (${model})...`,
+        });
+        indicatorTs = res.ts || undefined;
+      } catch (err) {
+        console.error("[Gemini] Failed to post indicator:", err);
+      }
+
+      const result = await queryGemini(query, model);
+      const response = result
+        ? formatGeminiResponse(result, model)
+        : "Gemini request failed. Please try again.";
+
+      if (indicatorTs) {
+        await app.client.chat.update({
+          channel: msg.channel,
+          ts: indicatorTs,
+          text: response,
+        }).catch((err: any) => console.error("[Gemini] Failed to update message:", err));
+      } else {
+        await app.client.chat.postMessage({
+          channel: msg.channel,
+          thread_ts: threadTs,
+          text: response,
+        }).catch((err: any) => console.error("[Gemini] Failed to post response:", err));
+      }
+
+      // Store response for later Claude context carry-over
+      if (result) {
+        const existing = geminiThreadHistory.get(threadTs) || [];
+        existing.push(`[${model}] ${result.text}`);
+        geminiThreadHistory.set(threadTs, existing);
+      }
+
+      return;
+    }
+
+    // "use claude code" with Gemini history → carry over context
+    if (detectClaudeCodeResume(cleanText) && geminiThreadHistory.has(threadTs)) {
+      const geminiContext = buildGeminiContext(threadTs);
+      const filePrefix = await extractFilePrefix(msg.files as SlackFile[] | undefined);
+      const resumeText = cleanText.replace(/\buse\s+claude(?:\s+code)?\s*/i, "").trim();
+      const activeForResume = getActiveDiscussion(threadTs);
+
+      if (activeForResume) {
+        // Already in a Claude session → send Gemini context as a follow-up reply
+        const context = await fetchThreadContext(app, msg.channel, threadTs, activeForResume.lastSeenTs, botUserId);
+        const prompt = filePrefix + context + geminiContext + (resumeText || "Continue our task based on the Gemini analysis above.");
+        await handleDiscussReply(app, threadTs, prompt);
+      } else {
+        // No active session → start a new one with Gemini context
+        const context = await fetchThreadContext(app, msg.channel, threadTs, null, botUserId);
+        const prompt = filePrefix + context + geminiContext + (resumeText || "Continue our task based on the Gemini analysis above.");
+        await startDiscussSession(app, msg.channel, threadTs, prompt);
+      }
+      return;
+    }
 
     // Handle discuss commands
     const cmd = cleanText.toLowerCase();

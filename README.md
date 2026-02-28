@@ -106,6 +106,19 @@ Configure: `MONITOR_DELAY_CHANNELS`, `DELAY_ALERT_TASK_PATTERNS`, `DELAY_ALERT_T
 
 Configure: `DISCUSS_MODEL`
 
+### 6. Gemini with Google Search Grounding
+
+Use Gemini for ground-truth checking with live web data. Responses can be carried over as context when switching back to Claude.
+
+**Commands (via @mention):**
+- `@EnzoBot use gemini <query>` — Query Gemini (default: `gemini-2.5-flash`)
+- `@EnzoBot use gemini pro <query>` — Use `gemini-3.1-pro`
+- `@EnzoBot use gemini 2.5 pro <query>` — Use `gemini-2.5-pro`
+- `@EnzoBot use gemini 3 flash <query>` — Use `gemini-3-flash`
+- `@EnzoBot use claude code <instruction>` — Switch back to Claude CLI with Gemini responses as context
+
+Configure: `GEMINI_API_KEY`
+
 ## HTTP Endpoints
 
 | Endpoint         | Method | Description                                                    |
@@ -144,6 +157,7 @@ All configuration is via environment variables (`.env` file). See `.env.example`
 | `DISCUSS_MODEL`             | No       | `claude-sonnet-4-5-20250929`   | Model for DM and @mention CLI sessions           |
 | `PAYMENTS_REPO_PATH`        | No       | `~/go/src/github.com/payments` | Working directory for CLI processes              |
 | `REQUIRED_MCP_SERVERS`      | No       | `chrome-devtools,athena`       | MCP servers to force-enable                      |
+| `GEMINI_API_KEY`            | No       | —                              | Gemini API key for Google Search grounding       |
 
 ## Architecture
 
@@ -167,6 +181,7 @@ src/
     session.ts          # In-memory processing locks
     pagerduty.ts        # PagerDuty incident acknowledgement API
     mcp-config.ts       # MCP server override detection
+    gemini.ts           # Gemini API client with Google Search grounding
 ```
 
 ## Data
