@@ -5,6 +5,7 @@ import { getMcpConfigPath } from "./mcp-config.js";
 export interface CliRunResult {
   exitCode: number | null;
   costUsd?: number;
+  response?: string;
 }
 
 export interface DiscussCliResult {
@@ -53,6 +54,8 @@ export function spawnClaudeCli(
 
   const done = new Promise<CliRunResult>((resolve) => {
     let costUsd: number | undefined;
+    let response: string | undefined;
+    let assistantText = "";
     let stdout = "";
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -64,8 +67,27 @@ export function spawnClaudeCli(
         if (!line.trim()) continue;
         try {
           const obj = JSON.parse(line);
-          if (obj.type === "result" && typeof obj.total_cost_usd === "number") {
-            costUsd = obj.total_cost_usd;
+          if (obj.type === "assistant" && Array.isArray(obj.message?.content)) {
+            for (const block of obj.message.content) {
+              if (block.type === "text" && typeof block.text === "string") {
+                assistantText = block.text;
+              }
+            }
+          }
+          if (obj.type === "result") {
+            if (typeof obj.total_cost_usd === "number") costUsd = obj.total_cost_usd;
+            if (typeof obj.result === "string" && obj.result) {
+              response = obj.result;
+            } else if (Array.isArray(obj.result)) {
+              const texts = obj.result
+                .filter((b: any) => b.type === "text" && typeof b.text === "string")
+                .map((b: any) => b.text);
+              if (texts.length > 0) response = texts.join("\n");
+            }
+            if (!response) {
+              console.warn(`[ClaudeCLI] result field empty or unexpected type: ${typeof obj.result}`,
+                JSON.stringify(obj.result)?.slice(0, 200));
+            }
           }
         } catch {
           // not JSON, ignore
@@ -80,14 +102,18 @@ export function spawnClaudeCli(
 
     child.on("error", (err) => {
       console.error(`[ClaudeCLI] spawn error:`, err.message);
-      resolve({ exitCode: null, costUsd });
+      resolve({ exitCode: null, costUsd, response });
     });
 
     child.on("close", (code) => {
+      if (!response && assistantText) {
+        console.log(`[ClaudeCLI] Using assistant text fallback (${assistantText.length} chars)`);
+        response = assistantText;
+      }
       if (costUsd !== undefined) {
         console.log(`[ClaudeCLI] Done. Cost: $${costUsd.toFixed(4)}`);
       }
-      resolve({ exitCode: code, costUsd });
+      resolve({ exitCode: code, costUsd, response });
     });
   });
 
@@ -132,6 +158,7 @@ export function spawnDiscussCli(
     let inputTokens: number | undefined;
     let outputTokens: number | undefined;
     let numTurns: number | undefined;
+    let assistantText = "";
     let stdout = "";
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -153,12 +180,31 @@ export function spawnDiscussCli(
               inputTokens = base + cacheCreation + cacheRead;
               if (typeof usage.output_tokens === "number") outputTokens = usage.output_tokens;
             }
+            // Track assistant text as fallback for empty result field
+            if (Array.isArray(obj.message?.content)) {
+              for (const block of obj.message.content) {
+                if (block.type === "text" && typeof block.text === "string") {
+                  assistantText = block.text;
+                }
+              }
+            }
           }
           if (obj.type === "result") {
             if (typeof obj.total_cost_usd === "number") costUsd = obj.total_cost_usd;
-            if (typeof obj.result === "string") response = obj.result;
+            if (typeof obj.result === "string" && obj.result) {
+              response = obj.result;
+            } else if (Array.isArray(obj.result)) {
+              const texts = obj.result
+                .filter((b: any) => b.type === "text" && typeof b.text === "string")
+                .map((b: any) => b.text);
+              if (texts.length > 0) response = texts.join("\n");
+            }
             if (typeof obj.session_id === "string") sessionId = obj.session_id;
             if (typeof obj.num_turns === "number") numTurns = obj.num_turns;
+            if (!response) {
+              console.warn(`[DiscussCLI] result field empty or unexpected type: ${typeof obj.result}`,
+                JSON.stringify(obj.result)?.slice(0, 200));
+            }
           }
         } catch {
           // not JSON, ignore
@@ -177,6 +223,10 @@ export function spawnDiscussCli(
     });
 
     child.on("close", (code) => {
+      if (!response && assistantText) {
+        console.log(`[DiscussCLI] Using assistant text fallback (${assistantText.length} chars)`);
+        response = assistantText;
+      }
       if (costUsd !== undefined) {
         console.log(`[DiscussCLI] Done. Cost: $${costUsd.toFixed(4)}`);
       }

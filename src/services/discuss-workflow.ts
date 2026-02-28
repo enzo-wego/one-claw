@@ -6,6 +6,7 @@ import {
   compactCliSession,
   type DiscussCliResult,
 } from "./claude-cli.js";
+import { insertWorkflow, updateWorkflowCliSession, deleteWorkflow, getWorkflowsByType } from "./database.js";
 
 const SLACK_MAX_LENGTH = 3900;
 const CONTEXT_WARN_TOKENS = 150_000;
@@ -118,6 +119,7 @@ async function runDiscussCliWithHeartbeat(
 
     if (result.sessionId) {
       discussion.cliSessionId = result.sessionId;
+      updateWorkflowCliSession(discussion.threadTs, result.sessionId);
     }
 
     let fullText: string;
@@ -195,6 +197,7 @@ export async function startDiscussSession(
     lastSeenTs: null,
   };
   discussions.set(messageTs, discussion);
+  insertWorkflow(messageTs, "discuss", channelId);
 
   console.log(`[Discuss] New session in ${channelId}, thread ${messageTs}`);
 
@@ -378,6 +381,7 @@ export async function handleDiscussExit(
   }
 
   discussions.delete(threadTs);
+  deleteWorkflow(threadTs);
 
   console.log(`[Discuss] Session ended for thread ${threadTs}`);
 
@@ -422,6 +426,7 @@ export function killDiscussSession(threadTs: string): boolean {
     discussion.cliChild = null;
   }
   discussions.delete(threadTs);
+  deleteWorkflow(threadTs);
   console.log(`[Discuss] Killed session for thread ${threadTs} via API`);
   return true;
 }
@@ -434,9 +439,29 @@ export function killAllDiscussWorkflows(): void {
       discussion.cliChild = null;
       killed++;
     }
+    deleteWorkflow(key);
     discussions.delete(key);
   }
   if (killed > 0) {
     console.log(`[Discuss] Killed ${killed} active discussions`);
+  }
+}
+
+/** Restore persisted discuss sessions from DB on startup */
+export function restoreDiscussions(): void {
+  const rows = getWorkflowsByType("discuss");
+  for (const row of rows) {
+    const discussion: ActiveDiscussion = {
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      cliSessionId: row.cli_session_id,
+      cliChild: null,
+      isProcessing: false,
+      lastSeenTs: null,
+    };
+    discussions.set(row.thread_ts, discussion);
+  }
+  if (rows.length > 0) {
+    console.log(`[Discuss] Restored ${rows.length} sessions`);
   }
 }

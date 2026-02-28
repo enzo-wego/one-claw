@@ -72,6 +72,7 @@ npx tsc --noEmit     # Type check only (no emit, outDir is dist/)
 - Environment config centralized in `config.ts` — never read `process.env` directly elsewhere
 - Console logging with prefixes: `[DailySummary]`, `[AlertWorkflow]`, `[Discuss]`, `[ClaudeCLI]`, etc.
 - Slack message handlers registered via `app.message()` — each handler filters by channel ID
+- **Strong consistency:** All critical runtime state (workflow tracking, alert counters, session state) must be persisted to SQLite. Never rely on in-memory-only state for data that must survive restarts. The bot restarts daily and can restart unexpectedly.
 
 ## Important Notes
 

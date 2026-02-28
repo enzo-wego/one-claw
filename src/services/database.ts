@@ -25,6 +25,23 @@ export interface Message {
   created_at: string;
 }
 
+export interface AlertCounterRow {
+  dag_name: string;
+  count: number;
+  first_seen_at: number;
+  window_expires_at: number;
+}
+
+export interface ActiveWorkflowRow {
+  thread_ts: string;
+  workflow_type: "alert" | "delay_alert" | "discuss";
+  channel_id: string;
+  incident_id: string | null;
+  dag_name: string | null;
+  cli_session_id: string | null;
+  created_at: string;
+}
+
 function generateSessionId(): string {
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -62,6 +79,23 @@ export function initDatabase(dbPath: string): Database.Database {
       content TEXT NOT NULL,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS alert_counters (
+      dag_name TEXT PRIMARY KEY,
+      count INTEGER NOT NULL DEFAULT 0,
+      first_seen_at INTEGER NOT NULL,
+      window_expires_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS active_workflows (
+      thread_ts TEXT PRIMARY KEY,
+      workflow_type TEXT NOT NULL CHECK(workflow_type IN ('alert', 'delay_alert', 'discuss')),
+      channel_id TEXT NOT NULL,
+      incident_id TEXT,
+      dag_name TEXT,
+      cli_session_id TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
     );
   `);
 
@@ -136,6 +170,78 @@ export function getActiveSessionCount(): number {
 export function getTotalSessionCount(): number {
   const row = getDb().prepare("SELECT COUNT(*) as count FROM sessions").get() as { count: number };
   return row.count;
+}
+
+// --- Alert Counters ---
+
+export function upsertAlertCounter(
+  dagName: string,
+  count: number,
+  firstSeenAt: number,
+  windowExpiresAt: number
+): void {
+  getDb()
+    .prepare(
+      `INSERT INTO alert_counters (dag_name, count, first_seen_at, window_expires_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(dag_name) DO UPDATE SET count = ?, first_seen_at = ?, window_expires_at = ?`
+    )
+    .run(dagName, count, firstSeenAt, windowExpiresAt, count, firstSeenAt, windowExpiresAt);
+}
+
+export function getAlertCounter(dagName: string): AlertCounterRow | undefined {
+  return getDb()
+    .prepare("SELECT * FROM alert_counters WHERE dag_name = ?")
+    .get(dagName) as AlertCounterRow | undefined;
+}
+
+export function deleteAlertCounter(dagName: string): void {
+  getDb().prepare("DELETE FROM alert_counters WHERE dag_name = ?").run(dagName);
+}
+
+export function getAllAlertCounters(): AlertCounterRow[] {
+  return getDb().prepare("SELECT * FROM alert_counters").all() as AlertCounterRow[];
+}
+
+// --- Active Workflows ---
+
+export function insertWorkflow(
+  threadTs: string,
+  workflowType: ActiveWorkflowRow["workflow_type"],
+  channelId: string,
+  opts?: { incidentId?: string; dagName?: string; cliSessionId?: string }
+): void {
+  getDb()
+    .prepare(
+      `INSERT OR REPLACE INTO active_workflows (thread_ts, workflow_type, channel_id, incident_id, dag_name, cli_session_id)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      threadTs,
+      workflowType,
+      channelId,
+      opts?.incidentId ?? null,
+      opts?.dagName ?? null,
+      opts?.cliSessionId ?? null
+    );
+}
+
+export function updateWorkflowCliSession(threadTs: string, cliSessionId: string): void {
+  getDb()
+    .prepare("UPDATE active_workflows SET cli_session_id = ? WHERE thread_ts = ?")
+    .run(cliSessionId, threadTs);
+}
+
+export function deleteWorkflow(threadTs: string): void {
+  getDb().prepare("DELETE FROM active_workflows WHERE thread_ts = ?").run(threadTs);
+}
+
+export function getWorkflowsByType(
+  workflowType: ActiveWorkflowRow["workflow_type"]
+): ActiveWorkflowRow[] {
+  return getDb()
+    .prepare("SELECT * FROM active_workflows WHERE workflow_type = ?")
+    .all(workflowType) as ActiveWorkflowRow[];
 }
 
 export function closeDatabase(): void {

@@ -6,6 +6,11 @@ import {
   getActiveDelayWorkflow,
   isWorkflowActiveForDag,
 } from "../services/delay-alert-workflow.js";
+import {
+  upsertAlertCounter,
+  deleteAlertCounter,
+  getAllAlertCounters,
+} from "../services/database.js";
 
 /** Map of channel name → channel ID, populated at startup */
 const delayChannelIds = new Map<string, string>();
@@ -91,6 +96,41 @@ interface AlertCounter {
 
 const alertCounters = new Map<string, AlertCounter>();
 
+/** Restore persisted alert counters from DB on startup */
+export function restoreAlertCounters(): void {
+  const rows = getAllAlertCounters();
+  const now = Date.now();
+  let restored = 0;
+  let expired = 0;
+
+  for (const row of rows) {
+    if (row.window_expires_at <= now) {
+      deleteAlertCounter(row.dag_name);
+      expired++;
+      continue;
+    }
+
+    const remaining = row.window_expires_at - now;
+    const timer = setTimeout(() => {
+      console.log(`[DelayAlertMonitor] Window expired for Dag: ${row.dag_name}, resetting counter`);
+      alertCounters.delete(row.dag_name);
+      deleteAlertCounter(row.dag_name);
+    }, remaining);
+
+    alertCounters.set(row.dag_name, {
+      dagName: row.dag_name,
+      count: row.count,
+      firstSeenAt: row.first_seen_at,
+      windowTimer: timer,
+    });
+    restored++;
+  }
+
+  if (restored > 0 || expired > 0) {
+    console.log(`[DelayAlertMonitor] Restored ${restored} counters, expired ${expired}`);
+  }
+}
+
 /** Register the delay alert monitor as a Slack message handler */
 export function registerDelayAlertMonitor(app: App, ownerUserId: string): void {
   app.message(async ({ message }) => {
@@ -128,21 +168,25 @@ export function registerDelayAlertMonitor(app: App, ownerUserId: string): void {
     // Look up or create counter
     let counter = alertCounters.get(dagName);
     if (!counter) {
+      const now = Date.now();
+      const windowExpiresAt = now + config.delayAlertWindowMs;
       const timer = setTimeout(() => {
         console.log(`[DelayAlertMonitor] Window expired for Dag: ${dagName}, resetting counter`);
         alertCounters.delete(dagName);
+        deleteAlertCounter(dagName);
       }, config.delayAlertWindowMs);
 
       counter = {
         dagName,
         count: 0,
-        firstSeenAt: Date.now(),
+        firstSeenAt: now,
         windowTimer: timer,
       };
       alertCounters.set(dagName, counter);
     }
 
     counter.count++;
+    upsertAlertCounter(dagName, counter.count, counter.firstSeenAt, counter.firstSeenAt + config.delayAlertWindowMs);
     console.log(
       `[DelayAlertMonitor] Dag: ${dagName} count: ${counter.count}/${config.delayAlertThreshold}`
     );
@@ -160,6 +204,7 @@ export function registerDelayAlertMonitor(app: App, ownerUserId: string): void {
       // Reset counter
       clearTimeout(counter.windowTimer);
       alertCounters.delete(dagName);
+      deleteAlertCounter(dagName);
 
       console.log(
         `[DelayAlertMonitor] Threshold reached for Dag: ${dagName}, starting workflow`

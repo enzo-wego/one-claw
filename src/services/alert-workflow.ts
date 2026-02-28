@@ -3,6 +3,7 @@ import type { ChildProcess } from "node:child_process";
 import { config } from "../config.js";
 import { acknowledgePagerDutyIncident } from "./pagerduty.js";
 import { spawnClaudeCli } from "./claude-cli.js";
+import { insertWorkflow, deleteWorkflow, getWorkflowsByType } from "./database.js";
 
 interface ActiveWorkflow {
   channelId: string;
@@ -88,6 +89,7 @@ export async function startAlertWorkflow(
     feedbackTimer: null,
   };
   workflows.set(messageTs, workflow);
+  insertWorkflow(messageTs, "alert", channelId, { incidentId: incidentId ?? undefined });
 
   console.log(
     `[AlertWorkflow] Started for thread ${messageTs}` +
@@ -193,7 +195,12 @@ export async function cleanupWorkflow(
   }
 
   workflows.delete(workflow.threadTs);
+  deleteWorkflow(workflow.threadTs);
   console.log(`[AlertWorkflow] Cleaned up workflow for thread ${workflow.threadTs}`);
+}
+
+export function isAlertWorkflowActive(messageTs: string): boolean {
+  return workflows.has(messageTs);
 }
 
 export function getActiveWorkflow(threadTs: string): ActiveWorkflow | undefined {
@@ -223,6 +230,7 @@ export function killAlertWorkflow(threadTs: string): boolean {
     workflow.cliChild = null;
   }
   workflows.delete(threadTs);
+  deleteWorkflow(threadTs);
   console.log(`[AlertWorkflow] Killed workflow for thread ${threadTs} via API`);
   return true;
 }
@@ -234,9 +242,29 @@ export function killAllWorkflows(): void {
       workflow.cliChild.kill("SIGTERM");
       workflow.cliChild = null;
     }
+    deleteWorkflow(key);
     workflows.delete(key);
   }
   if (workflows.size > 0) {
     console.log(`Killed ${workflows.size} active alert workflows`);
+  }
+}
+
+/** Restore persisted alert workflows from DB on startup */
+export function restoreAlertWorkflows(app: App): void {
+  const rows = getWorkflowsByType("alert");
+  for (const row of rows) {
+    const workflow: ActiveWorkflow = {
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      incidentId: row.incident_id,
+      cliChild: null,
+      feedbackTimer: null,
+    };
+    workflows.set(row.thread_ts, workflow);
+    startFeedbackTimer(app, workflow);
+  }
+  if (rows.length > 0) {
+    console.log(`[AlertWorkflow] Restored ${rows.length} workflows`);
   }
 }

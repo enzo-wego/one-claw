@@ -16,14 +16,14 @@ console.warn = (...args: unknown[]) => {
 
 import { config } from "./config.js";
 import { initDatabase, closeDatabase } from "./services/database.js";
-import { startHttpServer, setSlackConnected, setDailySummaryTrigger, stopHttpServer } from "./server.js";
+import { startHttpServer, setSlackConnected, setDailySummaryTrigger, setSlackApp, stopHttpServer } from "./server.js";
 import { registerHandlers } from "./handlers/message.js";
 import { registerAlertMonitor, resolveMonitorChannels } from "./handlers/alert-monitor.js";
-import { resolveDelayChannels, registerDelayAlertMonitor } from "./handlers/delay-alert-monitor.js";
+import { resolveDelayChannels, registerDelayAlertMonitor, restoreAlertCounters } from "./handlers/delay-alert-monitor.js";
 import { runDailySummary } from "./services/daily-summary.js";
-import { killAllWorkflows } from "./services/alert-workflow.js";
-import { killAllDelayWorkflows } from "./services/delay-alert-workflow.js";
-import { killAllDiscussWorkflows } from "./services/discuss-workflow.js";
+import { killAllWorkflows, restoreAlertWorkflows } from "./services/alert-workflow.js";
+import { killAllDelayWorkflows, restoreDelayWorkflows } from "./services/delay-alert-workflow.js";
+import { killAllDiscussWorkflows, restoreDiscussions } from "./services/discuss-workflow.js";
 import { detectMcpOverrides } from "./services/mcp-config.js";
 import { App, LogLevel } from "@slack/bolt";
 
@@ -139,6 +139,7 @@ function scheduleDailySummary(): void {
 
 // Register HTTP trigger for manual testing
 setDailySummaryTrigger(triggerDailySummary);
+setSlackApp(app);
 
 // Start HTTP server
 startHttpServer(config.port);
@@ -156,6 +157,13 @@ startHttpServer(config.port);
   // Resolve all channel names to IDs before registering handlers
   await resolveMonitorChannels(app);
   await resolveDelayChannels(app);
+
+  // Restore persisted state before registering handlers
+  restoreAlertCounters();
+  restoreAlertWorkflows(app);
+  restoreDelayWorkflows(app);
+  restoreDiscussions();
+
   // Register message handlers
   registerHandlers(app, botUserId, config.ownerUserId);
   registerAlertMonitor(app, config.ownerUserId);

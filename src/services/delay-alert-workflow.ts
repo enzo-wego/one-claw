@@ -2,6 +2,7 @@ import type { App } from "@slack/bolt";
 import type { ChildProcess } from "node:child_process";
 import { config } from "../config.js";
 import { spawnClaudeCli } from "./claude-cli.js";
+import { insertWorkflow, deleteWorkflow, getWorkflowsByType } from "./database.js";
 
 interface DelayAlertWorkflow {
   channelId: string;
@@ -56,6 +57,7 @@ export async function startDelayAlertWorkflow(
     feedbackTimer: null,
   };
   workflows.set(messageTs, workflow);
+  insertWorkflow(messageTs, "delay_alert", channelId, { dagName });
 
   console.log(
     `[DelayAlertWorkflow] Started for Dag: ${dagName}, thread ${messageTs}`
@@ -136,6 +138,7 @@ export async function cleanupDelayWorkflow(
   }
 
   workflows.delete(workflow.threadTs);
+  deleteWorkflow(workflow.threadTs);
   console.log(
     `[DelayAlertWorkflow] Cleaned up workflow for Dag: ${workflow.dagName}, thread ${workflow.threadTs}`
   );
@@ -170,6 +173,7 @@ export function killDelayWorkflow(threadTs: string): boolean {
     workflow.cliChild = null;
   }
   workflows.delete(threadTs);
+  deleteWorkflow(threadTs);
   console.log(`[DelayAlertWorkflow] Killed workflow for thread ${threadTs} via API`);
   return true;
 }
@@ -188,9 +192,29 @@ export function killAllDelayWorkflows(): void {
       workflow.cliChild.kill("SIGTERM");
       workflow.cliChild = null;
     }
+    deleteWorkflow(key);
     workflows.delete(key);
   }
   if (workflows.size > 0) {
     console.log(`Killed ${workflows.size} active delay alert workflows`);
+  }
+}
+
+/** Restore persisted delay alert workflows from DB on startup */
+export function restoreDelayWorkflows(app: App): void {
+  const rows = getWorkflowsByType("delay_alert");
+  for (const row of rows) {
+    const workflow: DelayAlertWorkflow = {
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      dagName: row.dag_name || "unknown",
+      cliChild: null,
+      feedbackTimer: null,
+    };
+    workflows.set(row.thread_ts, workflow);
+    startFeedbackTimer(app, workflow);
+  }
+  if (rows.length > 0) {
+    console.log(`[DelayAlertWorkflow] Restored ${rows.length} workflows`);
   }
 }

@@ -1,14 +1,20 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { App } from "@slack/bolt";
 import { getAllDiscussions, killDiscussSession } from "./services/discuss-workflow.js";
-import { getAllAlertWorkflows, killAlertWorkflow } from "./services/alert-workflow.js";
-import { getAllDelayWorkflows, killDelayWorkflow } from "./services/delay-alert-workflow.js";
+import { getAllAlertWorkflows, killAlertWorkflow, startAlertWorkflow, isAlertWorkflowActive } from "./services/alert-workflow.js";
+import { getAllDelayWorkflows, killDelayWorkflow, startDelayAlertWorkflow, getActiveDelayWorkflow } from "./services/delay-alert-workflow.js";
 
 const startTime = Date.now();
 let slackConnected = false;
+let slackApp: App | undefined;
 let onTriggerDailySummary: (() => void) | undefined;
 
 export function setSlackConnected(connected: boolean): void {
   slackConnected = connected;
+}
+
+export function setSlackApp(app: App): void {
+  slackApp = app;
 }
 
 export function setDailySummaryTrigger(fn: () => void): void {
@@ -139,6 +145,135 @@ function handleDailySummary(req: IncomingMessage, res: ServerResponse): void {
   onTriggerDailySummary();
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ status: "started" }));
+}
+
+function parseSlackUrl(url: string): { channelId: string; messageTs: string } | null {
+  const match = url.match(/\/archives\/([A-Z0-9]+)\/p(\d+)/i);
+  if (!match) return null;
+  const channelId = match[1];
+  const raw = match[2];
+  // Insert '.' before last 6 digits: p1709123456789012 → 1709123456.789012
+  const messageTs = raw.slice(0, raw.length - 6) + "." + raw.slice(raw.length - 6);
+  return { channelId, messageTs };
+}
+
+function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString()));
+      } catch {
+        reject(new Error("invalid JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function jsonError(res: ServerResponse, status: number, error: string): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error }));
+}
+
+async function handleTriggerAlert(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") { jsonError(res, 405, "POST only"); return; }
+  if (!slackApp) { jsonError(res, 503, "Slack app not configured"); return; }
+
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    jsonError(res, 400, "invalid JSON body"); return;
+  }
+
+  const url = body.url;
+  if (typeof url !== "string" || !url) { jsonError(res, 400, "missing url"); return; }
+
+  const parsed = parseSlackUrl(url);
+  if (!parsed) { jsonError(res, 400, "invalid Slack URL"); return; }
+
+  const { channelId, messageTs } = parsed;
+
+  if (isAlertWorkflowActive(messageTs)) {
+    jsonError(res, 409, "workflow already active for this message"); return;
+  }
+
+  // Fetch the message from Slack
+  let text = "";
+  let attachments: Array<Record<string, unknown>> | undefined;
+  try {
+    const result = await slackApp.client.conversations.history({
+      channel: channelId,
+      latest: messageTs,
+      inclusive: true,
+      limit: 1,
+    });
+    const msg = result.messages?.[0];
+    if (msg) {
+      text = (msg.text as string) || "";
+      attachments = msg.attachments as Array<Record<string, unknown>> | undefined;
+    }
+  } catch (err) {
+    jsonError(res, 500, `failed to fetch Slack message: ${err}`); return;
+  }
+
+  startAlertWorkflow(slackApp, channelId, messageTs, text, attachments);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ status: "started", channelId, messageTs }));
+}
+
+async function handleTriggerDelayAlert(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") { jsonError(res, 405, "POST only"); return; }
+  if (!slackApp) { jsonError(res, 503, "Slack app not configured"); return; }
+
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    jsonError(res, 400, "invalid JSON body"); return;
+  }
+
+  const url = body.url;
+  if (typeof url !== "string" || !url) { jsonError(res, 400, "missing url"); return; }
+
+  const parsed = parseSlackUrl(url);
+  if (!parsed) { jsonError(res, 400, "invalid Slack URL"); return; }
+
+  const { channelId, messageTs } = parsed;
+
+  if (getActiveDelayWorkflow(messageTs)) {
+    jsonError(res, 409, "workflow already active for this message"); return;
+  }
+
+  // Fetch the message from Slack
+  let text = "";
+  try {
+    const result = await slackApp.client.conversations.history({
+      channel: channelId,
+      latest: messageTs,
+      inclusive: true,
+      limit: 1,
+    });
+    const msg = result.messages?.[0];
+    if (msg) {
+      text = (msg.text as string) || "";
+    }
+  } catch (err) {
+    jsonError(res, 500, `failed to fetch Slack message: ${err}`); return;
+  }
+
+  // Extract dag name from message text
+  const dagMatch = text.match(/\*Dag\*:\s*(.+)/);
+  if (!dagMatch) {
+    jsonError(res, 400, "no dag name found in message text"); return;
+  }
+  const dagName = dagMatch[1].trim();
+
+  startDelayAlertWorkflow(slackApp, channelId, messageTs, text, dagName);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ status: "started", channelId, messageTs, dagName }));
 }
 
 const openApiSpec = {
@@ -312,6 +447,105 @@ const openApiSpec = {
         },
       },
     },
+    "/trigger-alert": {
+      post: {
+        summary: "Trigger alert investigation",
+        description: "Manually triggers a PagerDuty alert investigation on a specific Slack message. Parses the Slack URL, fetches the message, and starts the alert workflow.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["url"],
+                properties: {
+                  url: { type: "string", example: "https://wego.slack.com/archives/C0ABC/p1709123456789012" },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Investigation started",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", example: "started" },
+                    channelId: { type: "string", example: "C0ABC" },
+                    messageTs: { type: "string", example: "1709123456.789012" },
+                  },
+                },
+              },
+            },
+          },
+          "400": {
+            description: "Invalid request (missing/invalid URL)",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+          "409": {
+            description: "Workflow already active for this message",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+          "503": {
+            description: "Slack app not configured",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+        },
+      },
+    },
+    "/trigger-delay-alert": {
+      post: {
+        summary: "Trigger delay alert investigation",
+        description: "Manually triggers an Airflow delay alert investigation on a specific Slack message. Parses the Slack URL, fetches the message, extracts the DAG name, and starts the delay workflow.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["url"],
+                properties: {
+                  url: { type: "string", example: "https://wego.slack.com/archives/C0ABC/p1709123456789012" },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Investigation started",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", example: "started" },
+                    channelId: { type: "string", example: "C0ABC" },
+                    messageTs: { type: "string", example: "1709123456.789012" },
+                    dagName: { type: "string", example: "payments.process-taxes" },
+                  },
+                },
+              },
+            },
+          },
+          "400": {
+            description: "Invalid request (missing/invalid URL, no dag name in message)",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+          "409": {
+            description: "Workflow already active for this message",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+          "503": {
+            description: "Slack app not configured",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+        },
+      },
+    },
   },
 };
 
@@ -355,6 +589,8 @@ export function startHttpServer(port: number): void {
       return handleKillSession(threadTs, res);
     }
     if (req.url === "/daily-summary") return handleDailySummary(req, res);
+    if (req.url === "/trigger-alert") return void handleTriggerAlert(req, res);
+    if (req.url === "/trigger-delay-alert") return void handleTriggerDelayAlert(req, res);
     if (req.url === "/") return handleIndex(req, res);
     res.writeHead(404);
     res.end("Not found");
