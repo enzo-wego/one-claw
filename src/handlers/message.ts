@@ -9,7 +9,7 @@ import {
 } from "../services/discuss-workflow.js";
 import { getActiveWorkflow } from "../services/alert-workflow.js";
 import { getActiveDelayWorkflow } from "../services/delay-alert-workflow.js";
-import { spawnDiscussCli } from "../services/claude-cli.js";
+import { spawnDiscussCli, detectAndLoadSkill } from "../services/claude-cli.js";
 import {
   downloadSlackFiles,
   buildFilePromptPrefix,
@@ -89,8 +89,10 @@ async function handleDm(
 
   try {
     const prompt = filePrefix + cleanText;
+    const skillContext = detectAndLoadSkill(cleanText) ?? undefined;
     const { done } = spawnDiscussCli(prompt, config.paymentsRepoPath, {
       model: config.discussModel,
+      skillContext,
     });
     const result = await done;
 

@@ -1,7 +1,7 @@
 import type { App } from "@slack/bolt";
 import type { ChildProcess } from "node:child_process";
 import { config } from "../config.js";
-import { spawnClaudeCli } from "./claude-cli.js";
+import { spawnClaudeCli, safeKill } from "./claude-cli.js";
 import { insertWorkflow, deleteWorkflow, getWorkflowsByType } from "./database.js";
 
 interface DelayAlertWorkflow {
@@ -94,7 +94,7 @@ export async function handleDelayOwnerFeedback(
 
   // Kill any running CLI before spawning a new one
   if (workflow.cliChild) {
-    workflow.cliChild.kill("SIGTERM");
+    safeKill(workflow.cliChild);
     workflow.cliChild = null;
   }
 
@@ -122,7 +122,7 @@ export async function cleanupDelayWorkflow(
   clearFeedbackTimer(workflow);
 
   if (workflow.cliChild) {
-    workflow.cliChild.kill("SIGTERM");
+    safeKill(workflow.cliChild);
     workflow.cliChild = null;
   }
 
@@ -169,7 +169,7 @@ export function killDelayWorkflow(threadTs: string): boolean {
   if (!workflow) return false;
   clearFeedbackTimer(workflow);
   if (workflow.cliChild) {
-    workflow.cliChild.kill("SIGTERM");
+    safeKill(workflow.cliChild);
     workflow.cliChild = null;
   }
   workflows.delete(threadTs);
@@ -189,7 +189,7 @@ export function killAllDelayWorkflows(): void {
   for (const [key, workflow] of workflows) {
     clearFeedbackTimer(workflow);
     if (workflow.cliChild) {
-      workflow.cliChild.kill("SIGTERM");
+      safeKill(workflow.cliChild);
       workflow.cliChild = null;
     }
     deleteWorkflow(key);

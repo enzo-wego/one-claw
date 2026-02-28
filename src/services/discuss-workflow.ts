@@ -4,6 +4,8 @@ import { config } from "../config.js";
 import {
   spawnDiscussCli,
   compactCliSession,
+  detectAndLoadSkill,
+  safeKill,
   type DiscussCliResult,
 } from "./claude-cli.js";
 import { insertWorkflow, updateWorkflowCliSession, deleteWorkflow, getWorkflowsByType } from "./database.js";
@@ -108,7 +110,7 @@ async function runDiscussCliWithHeartbeat(
   let timedOut = false;
   const timeoutTimer = setTimeout(() => {
     timedOut = true;
-    child.kill("SIGTERM");
+    safeKill(child);
   }, config.discussCliTimeoutMs);
 
   try {
@@ -213,8 +215,10 @@ export async function startDiscussSession(
     console.error(`[Discuss] Failed to post thinking indicator:`, err);
   }
 
+  const skillContext = detectAndLoadSkill(cleanText) ?? undefined;
   const { child, done } = spawnDiscussCli(cleanText, config.paymentsRepoPath, {
     model: config.discussModel,
+    skillContext,
   });
   discussion.cliChild = child;
 
@@ -376,7 +380,7 @@ export async function handleDiscussExit(
 
   // Kill any running CLI
   if (discussion.cliChild) {
-    discussion.cliChild.kill("SIGTERM");
+    safeKill(discussion.cliChild);
     discussion.cliChild = null;
   }
 
@@ -422,7 +426,7 @@ export function killDiscussSession(threadTs: string): boolean {
   const discussion = discussions.get(threadTs);
   if (!discussion) return false;
   if (discussion.cliChild) {
-    discussion.cliChild.kill("SIGTERM");
+    safeKill(discussion.cliChild);
     discussion.cliChild = null;
   }
   discussions.delete(threadTs);
@@ -435,7 +439,7 @@ export function killAllDiscussWorkflows(): void {
   let killed = 0;
   for (const [key, discussion] of discussions) {
     if (discussion.cliChild) {
-      discussion.cliChild.kill("SIGTERM");
+      safeKill(discussion.cliChild);
       discussion.cliChild = null;
       killed++;
     }

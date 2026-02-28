@@ -2,7 +2,7 @@ import type { App } from "@slack/bolt";
 import type { ChildProcess } from "node:child_process";
 import { config } from "../config.js";
 import { acknowledgePagerDutyIncident } from "./pagerduty.js";
-import { spawnClaudeCli } from "./claude-cli.js";
+import { spawnClaudeCli, safeKill } from "./claude-cli.js";
 import { insertWorkflow, deleteWorkflow, getWorkflowsByType } from "./database.js";
 
 interface ActiveWorkflow {
@@ -145,7 +145,7 @@ export async function handleOwnerFeedback(
 
   // Kill any running CLI before spawning a new one
   if (workflow.cliChild) {
-    workflow.cliChild.kill("SIGTERM");
+    safeKill(workflow.cliChild);
     workflow.cliChild = null;
   }
 
@@ -174,7 +174,7 @@ export async function cleanupWorkflow(
 
   // Kill any running CLI
   if (workflow.cliChild) {
-    workflow.cliChild.kill("SIGTERM");
+    safeKill(workflow.cliChild);
     workflow.cliChild = null;
   }
 
@@ -226,7 +226,7 @@ export function killAlertWorkflow(threadTs: string): boolean {
   if (!workflow) return false;
   clearFeedbackTimer(workflow);
   if (workflow.cliChild) {
-    workflow.cliChild.kill("SIGTERM");
+    safeKill(workflow.cliChild);
     workflow.cliChild = null;
   }
   workflows.delete(threadTs);
@@ -239,7 +239,7 @@ export function killAllWorkflows(): void {
   for (const [key, workflow] of workflows) {
     clearFeedbackTimer(workflow);
     if (workflow.cliChild) {
-      workflow.cliChild.kill("SIGTERM");
+      safeKill(workflow.cliChild);
       workflow.cliChild = null;
     }
     deleteWorkflow(key);
