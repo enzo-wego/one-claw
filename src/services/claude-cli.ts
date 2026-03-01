@@ -219,13 +219,16 @@ export function spawnDiscussCli(
     "--output-format", "stream-json"
   );
 
-  const systemPrompt =
-    "CRITICAL RULES FOR SKILL EXECUTION:\n" +
-    "1. When executing skills, you MUST complete EVERY step in the EXACT sequential order defined in the skill workflow. NEVER skip, reorder, or omit any step.\n" +
-    "2. Many skills have infrastructure prerequisites (SSO login, VPN tunnels via sshuttle, browser authorization). These MUST complete before any API/MCP tool calls. If you skip tunnel setup, API calls WILL timeout because servers are behind a VPN.\n" +
-    "3. Do not check or use the current git branch unless the skill explicitly instructs you to.\n" +
-    "4. If a step fails, report the failure — do NOT skip ahead to later steps.";
-  args.push("--append-system-prompt", systemPrompt);
+  let systemPrompt: string | undefined;
+  if (options?.skillContext) {
+    systemPrompt =
+      "CRITICAL RULES FOR SKILL EXECUTION:\n" +
+      "1. When executing skills, you MUST complete EVERY step in the EXACT sequential order defined in the skill workflow. NEVER skip, reorder, or omit any step.\n" +
+      "2. Many skills have infrastructure prerequisites (SSO login, VPN tunnels via sshuttle, browser authorization). These MUST complete before any API/MCP tool calls. If you skip tunnel setup, API calls WILL timeout because servers are behind a VPN.\n" +
+      "3. Do not check or use the current git branch unless the skill explicitly instructs you to.\n" +
+      "4. If a step fails, report the failure — do NOT skip ahead to later steps.";
+    args.push("--append-system-prompt", systemPrompt);
+  }
 
   const mcpOverride = getMcpConfigPath();
   if (mcpOverride) {
@@ -235,7 +238,9 @@ export function spawnDiscussCli(
   const promptPreview = effectivePrompt.length > PROMPT_LOG_LIMIT ? effectivePrompt.slice(0, PROMPT_LOG_LIMIT) + "..." : effectivePrompt;
   console.log(`[DiscussCLI] Spawning with prompt: ${promptPreview}`);
   console.log(`[DiscussCLI] Args: ${JSON.stringify(args.filter(a => a !== effectivePrompt && a !== systemPrompt))}`);
-  console.log(`[DiscussCLI] System prompt: ${systemPrompt.slice(0, 200)}...`);
+  if (systemPrompt) {
+    console.log(`[DiscussCLI] System prompt: ${systemPrompt.slice(0, 200)}...`);
+  }
 
   const child = spawn("claude", args, {
     cwd,
