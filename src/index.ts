@@ -166,8 +166,8 @@ startHttpServer(config.port);
 
   // Register message handlers
   registerHandlers(app, botUserId, config.ownerUserId);
-  registerAlertMonitor(app, config.ownerUserId);
-  registerDelayAlertMonitor(app, config.ownerUserId);
+  registerAlertMonitor(app, config.ownerUserId, botUserId);
+  registerDelayAlertMonitor(app, config.ownerUserId, botUserId);
 
   scheduleDailyRestart();
   scheduleDailySummary();

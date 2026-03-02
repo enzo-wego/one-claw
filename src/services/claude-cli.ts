@@ -8,6 +8,10 @@ export interface CliRunResult {
   exitCode: number | null;
   costUsd?: number;
   response?: string;
+  /** The longest assistant text block (typically the detailed report) */
+  fullReport?: string;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 export interface DiscussCliResult {
@@ -29,6 +33,28 @@ export interface CompactResult {
 export interface SpawnResult {
   child: ChildProcess;
   done: Promise<CliRunResult>;
+}
+
+const SLACK_MAX_LENGTH = 3900;
+
+/** Split a long response into Slack-safe chunks, breaking at paragraph/line boundaries */
+export function chunkResponse(text: string, maxLength = SLACK_MAX_LENGTH): string[] {
+  if (text.length <= maxLength) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf("\n\n", maxLength);
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf("\n", maxLength);
+    if (splitAt <= 0) splitAt = maxLength;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
+  }
+  return chunks;
 }
 
 const STREAM_LOG_TEXT_LIMIT = 200;
@@ -91,21 +117,58 @@ export function detectAndLoadSkill(text: string): SkillContext | null {
 
 const PROMPT_LOG_LIMIT = 500;
 
+/** Shared system prompt enforcing strict sequential skill execution */
+const SKILL_SYSTEM_PROMPT =
+  "CRITICAL RULES FOR SKILL EXECUTION:\n" +
+  "1. When executing skills, you MUST complete EVERY step in the EXACT sequential order defined in the skill workflow. NEVER skip, reorder, or omit any step.\n" +
+  "2. Many skills have infrastructure prerequisites (SSO login, VPN tunnels via sshuttle, browser authorization). These MUST complete before any API/MCP tool calls. If you skip tunnel setup, API calls WILL timeout because servers are behind a VPN.\n" +
+  "3. Do not check or use the current git branch unless the skill explicitly instructs you to.\n" +
+  "4. If a step fails, report the failure — do NOT skip ahead to later steps.\n" +
+  "5. Your final response MUST be the investigation report itself — do NOT follow the report with a brief summary. The report IS the final output.";
+
+/** Build the effective prompt with full SKILL.md content injected */
+function buildSkillPrompt(skillContext: SkillContext, fallbackPrompt: string): string {
+  const { skillName, skillContent, skillArgs } = skillContext;
+  return (
+    `Execute skill "${skillName}" with arguments "${skillArgs}".\n\n` +
+    `<skill>\n${skillContent}\n</skill>\n\n` +
+    `IMPORTANT: Follow every step in the skill workflow exactly in order. ` +
+    `Do NOT skip any step. Many steps have infrastructure prerequisites ` +
+    `(SSO login, VPN tunnels via sshuttle, browser authorization) that MUST ` +
+    `complete before any API/MCP tool calls.`
+  );
+}
+
 export function spawnClaudeCli(
   prompt: string,
   cwd: string,
-  options?: { signal?: AbortSignal }
+  options?: { signal?: AbortSignal; skillContext?: SkillContext }
 ): SpawnResult {
-  const args = ["-p", prompt, "--verbose", "--model", config.alertModel, "--dangerously-skip-permissions", "--output-format", "stream-json"];
+  // If skill context is provided, inject full SKILL.md content into the prompt
+  const effectivePrompt = options?.skillContext
+    ? buildSkillPrompt(options.skillContext, prompt)
+    : prompt;
+
+  const args = ["-p", effectivePrompt, "--verbose", "--model", config.alertModel, "--dangerously-skip-permissions", "--output-format", "stream-json"];
+
+  // Append system prompt enforcing strict skill execution
+  let systemPrompt: string | undefined;
+  if (options?.skillContext) {
+    systemPrompt = SKILL_SYSTEM_PROMPT;
+    args.push("--append-system-prompt", systemPrompt);
+  }
 
   const mcpOverride = getMcpConfigPath();
   if (mcpOverride) {
     args.push("--mcp-config", mcpOverride);
   }
 
-  const promptPreview = prompt.length > PROMPT_LOG_LIMIT ? prompt.slice(0, PROMPT_LOG_LIMIT) + "..." : prompt;
+  const promptPreview = effectivePrompt.length > PROMPT_LOG_LIMIT ? effectivePrompt.slice(0, PROMPT_LOG_LIMIT) + "..." : effectivePrompt;
   console.log(`[ClaudeCLI] Spawning with prompt: ${promptPreview}`);
-  console.log(`[ClaudeCLI] Args: ${JSON.stringify(args.filter(a => a !== prompt))}`);
+  console.log(`[ClaudeCLI] Args: ${JSON.stringify(args.filter(a => a !== effectivePrompt && a !== systemPrompt))}`);
+  if (systemPrompt) {
+    console.log(`[ClaudeCLI] System prompt: ${systemPrompt.slice(0, 200)}...`);
+  }
 
   const child = spawn(
     "claude",
@@ -121,7 +184,10 @@ export function spawnClaudeCli(
   const done = new Promise<CliRunResult>((resolve) => {
     let costUsd: number | undefined;
     let response: string | undefined;
+    let inputTokens: number | undefined;
+    let outputTokens: number | undefined;
     let assistantText = "";
+    let longestAssistantText = "";
     let stdout = "";
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -133,11 +199,25 @@ export function spawnClaudeCli(
         if (!line.trim()) continue;
         try {
           const obj = JSON.parse(line);
-          if (obj.type === "assistant" && Array.isArray(obj.message?.content)) {
-            logStreamContent("ClaudeCLI", obj.message.content);
-            for (const block of obj.message.content) {
-              if (block.type === "text" && typeof block.text === "string") {
-                assistantText = block.text;
+          if (obj.type === "assistant") {
+            // Track token usage from assistant messages
+            const usage = obj.message?.usage;
+            if (usage) {
+              const base = typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
+              const cacheCreation = typeof usage.cache_creation_input_tokens === "number" ? usage.cache_creation_input_tokens : 0;
+              const cacheRead = typeof usage.cache_read_input_tokens === "number" ? usage.cache_read_input_tokens : 0;
+              inputTokens = base + cacheCreation + cacheRead;
+              if (typeof usage.output_tokens === "number") outputTokens = usage.output_tokens;
+            }
+            if (Array.isArray(obj.message?.content)) {
+              logStreamContent("ClaudeCLI", obj.message.content);
+              for (const block of obj.message.content) {
+                if (block.type === "text" && typeof block.text === "string") {
+                  assistantText = block.text;
+                  if (block.text.length > longestAssistantText.length) {
+                    longestAssistantText = block.text;
+                  }
+                }
               }
             }
           }
@@ -169,7 +249,8 @@ export function spawnClaudeCli(
 
     child.on("error", (err) => {
       console.error(`[ClaudeCLI] spawn error:`, err.message);
-      resolve({ exitCode: null, costUsd, response });
+      const fullReport = longestAssistantText || undefined;
+      resolve({ exitCode: null, costUsd, response, fullReport, inputTokens, outputTokens });
     });
 
     child.on("close", (code) => {
@@ -177,10 +258,14 @@ export function spawnClaudeCli(
         console.log(`[ClaudeCLI] Using assistant text fallback (${assistantText.length} chars)`);
         response = assistantText;
       }
+      const fullReport = longestAssistantText || undefined;
+      if (fullReport) {
+        console.log(`[ClaudeCLI] Longest assistant text: ${fullReport.length} chars`);
+      }
       if (costUsd !== undefined) {
         console.log(`[ClaudeCLI] Done. Cost: $${costUsd.toFixed(4)}`);
       }
-      resolve({ exitCode: code, costUsd, response });
+      resolve({ exitCode: code, costUsd, response, fullReport, inputTokens, outputTokens });
     });
   });
 
@@ -192,18 +277,10 @@ export function spawnDiscussCli(
   cwd: string,
   options?: { resumeSessionId?: string; model?: string; signal?: AbortSignal; skillContext?: SkillContext }
 ): { child: ChildProcess; done: Promise<DiscussCliResult> } {
-  // If skill context is provided, construct a directive prompt with full SKILL.md content
-  let effectivePrompt = prompt;
-  if (options?.skillContext) {
-    const { skillName, skillContent, skillArgs } = options.skillContext;
-    effectivePrompt =
-      `Execute skill "${skillName}" with arguments "${skillArgs}".\n\n` +
-      `<skill>\n${skillContent}\n</skill>\n\n` +
-      `IMPORTANT: Follow every step in the skill workflow exactly in order. ` +
-      `Do NOT skip any step. Many steps have infrastructure prerequisites ` +
-      `(SSO login, VPN tunnels via sshuttle, browser authorization) that MUST ` +
-      `complete before any API/MCP tool calls.`;
-  }
+  // If skill context is provided, inject full SKILL.md content into the prompt
+  const effectivePrompt = options?.skillContext
+    ? buildSkillPrompt(options.skillContext, prompt)
+    : prompt;
 
   const args: string[] = [];
 
@@ -221,12 +298,7 @@ export function spawnDiscussCli(
 
   let systemPrompt: string | undefined;
   if (options?.skillContext) {
-    systemPrompt =
-      "CRITICAL RULES FOR SKILL EXECUTION:\n" +
-      "1. When executing skills, you MUST complete EVERY step in the EXACT sequential order defined in the skill workflow. NEVER skip, reorder, or omit any step.\n" +
-      "2. Many skills have infrastructure prerequisites (SSO login, VPN tunnels via sshuttle, browser authorization). These MUST complete before any API/MCP tool calls. If you skip tunnel setup, API calls WILL timeout because servers are behind a VPN.\n" +
-      "3. Do not check or use the current git branch unless the skill explicitly instructs you to.\n" +
-      "4. If a step fails, report the failure — do NOT skip ahead to later steps.";
+    systemPrompt = SKILL_SYSTEM_PROMPT;
     args.push("--append-system-prompt", systemPrompt);
   }
 

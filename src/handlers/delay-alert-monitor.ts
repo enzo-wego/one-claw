@@ -132,7 +132,7 @@ export function restoreAlertCounters(): void {
 }
 
 /** Register the delay alert monitor as a Slack message handler */
-export function registerDelayAlertMonitor(app: App, ownerUserId: string): void {
+export function registerDelayAlertMonitor(app: App, ownerUserId: string, botUserId: string): void {
   app.message(async ({ message }) => {
     const msg = message as unknown as Record<string, unknown>;
     const channelId = msg.channel as string;
@@ -144,7 +144,7 @@ export function registerDelayAlertMonitor(app: App, ownerUserId: string): void {
     const text = (msg.text as string) || "";
 
     // Thread reply from owner on an active workflow → handle feedback
-    if (threadTs && msg.user === ownerUserId && getActiveDelayWorkflow(threadTs)) {
+    if (threadTs && msg.user === ownerUserId && getActiveDelayWorkflow(threadTs) && text.includes(`<@${botUserId}>`)) {
       await handleDelayOwnerFeedback(app, threadTs, text);
       return;
     }

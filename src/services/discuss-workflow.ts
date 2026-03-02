@@ -6,11 +6,11 @@ import {
   compactCliSession,
   detectAndLoadSkill,
   safeKill,
+  chunkResponse,
   type DiscussCliResult,
 } from "./claude-cli.js";
 import { insertWorkflow, updateWorkflowCliSession, deleteWorkflow, getWorkflowsByType } from "./database.js";
 
-const SLACK_MAX_LENGTH = 3900;
 const CONTEXT_WARN_TOKENS = 150_000;
 const CONTEXT_MAX_TOKENS = 200_000;
 
@@ -49,25 +49,6 @@ function buildUsageFooter(result: DiscussCliResult): string {
   }
 
   return footer;
-}
-
-function chunkResponse(text: string): string[] {
-  if (text.length <= SLACK_MAX_LENGTH) return [text];
-
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= SLACK_MAX_LENGTH) {
-      chunks.push(remaining);
-      break;
-    }
-    let splitAt = remaining.lastIndexOf("\n\n", SLACK_MAX_LENGTH);
-    if (splitAt <= 0) splitAt = remaining.lastIndexOf("\n", SLACK_MAX_LENGTH);
-    if (splitAt <= 0) splitAt = SLACK_MAX_LENGTH;
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
-  }
-  return chunks;
 }
 
 function stripMention(text: string): string {

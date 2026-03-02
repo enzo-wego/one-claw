@@ -49,6 +49,11 @@ export async function resolveMonitorChannels(app: App): Promise<void> {
   }
 }
 
+/** Check if a PagerDuty message is just a status notification (not a new alert) */
+function isPagerDutyStatusNotification(text: string): boolean {
+  return /^\s*(Acknowledged|Resolved)\b/i.test(text);
+}
+
 /** Check if a message is from PagerDuty */
 function isPagerDutyMessage(msg: Record<string, unknown>): boolean {
   // Check bot profile name
@@ -91,7 +96,7 @@ function isMonitoredChannel(channelId: string): boolean {
 }
 
 /** Register the alert monitor as a Slack message handler */
-export function registerAlertMonitor(app: App, ownerUserId: string): void {
+export function registerAlertMonitor(app: App, ownerUserId: string, botUserId: string): void {
   app.message(async ({ message }) => {
     const msg = message as unknown as Record<string, unknown>;
     const channelId = msg.channel as string;
@@ -105,15 +110,19 @@ export function registerAlertMonitor(app: App, ownerUserId: string): void {
       | Array<Record<string, unknown>>
       | undefined;
 
-    // Top-level PagerDuty message → start workflow
+    // Top-level PagerDuty message → start workflow (skip status notifications)
     if (!threadTs && isPagerDutyMessage(msg)) {
+      if (isPagerDutyStatusNotification(text)) {
+        console.log(`[AlertMonitor] Skipping PD status notification in ${channelId}: ${text.slice(0, 80)}`);
+        return;
+      }
       console.log(`[AlertMonitor] PagerDuty message detected in ${channelId}`);
       await startAlertWorkflow(app, channelId, messageTs, text, attachments);
       return;
     }
 
     // Thread reply from owner on an active workflow → handle feedback
-    if (threadTs && msg.user === ownerUserId && getActiveWorkflow(threadTs)) {
+    if (threadTs && msg.user === ownerUserId && getActiveWorkflow(threadTs) && text.includes(`<@${botUserId}>`)) {
       await handleOwnerFeedback(app, threadTs, text);
     }
   });

@@ -1,9 +1,24 @@
 import type { App } from "@slack/bolt";
 import type { ChildProcess } from "node:child_process";
 import { config } from "../config.js";
-import { acknowledgePagerDutyIncident } from "./pagerduty.js";
-import { spawnClaudeCli, safeKill } from "./claude-cli.js";
+import { acknowledgePagerDutyIncident, getPagerDutyIncidentStatus } from "./pagerduty.js";
+import { spawnClaudeCli, safeKill, detectAndLoadSkill, chunkResponse, type CliRunResult } from "./claude-cli.js";
 import { insertWorkflow, deleteWorkflow, getWorkflowsByType } from "./database.js";
+
+function formatTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+  return `${n}`;
+}
+
+function buildUsageFooter(result: CliRunResult): string {
+  const parts: string[] = [];
+  parts.push(`model: ${config.alertModel}`);
+  if (result.inputTokens != null) {
+    const pct = Math.round((result.inputTokens / 200_000) * 100);
+    parts.push(`context: ${formatTokens(result.inputTokens)} (${pct}%)`);
+  }
+  return `\n\n---\n_${parts.join(" | ")}_`;
+}
 
 interface ActiveWorkflow {
   channelId: string;
@@ -51,6 +66,15 @@ function buildSlackLink(channelId: string, messageTs: string): string {
   return `https://${config.slackWorkspaceDomain}/archives/${channelId}/p${tsNoDot}`;
 }
 
+/** Check if an incident is already being handled by an active workflow */
+function isIncidentAlreadyTracked(incidentId: string): boolean {
+  for (const w of workflows.values()) {
+    if (w.incidentId === incidentId) return true;
+  }
+  const dbRows = getWorkflowsByType("alert");
+  return dbRows.some(r => r.incident_id === incidentId);
+}
+
 /** Start the feedback timeout. On expiry, clean up the workflow. */
 function startFeedbackTimer(app: App, workflow: ActiveWorkflow): void {
   clearFeedbackTimer(workflow);
@@ -79,6 +103,13 @@ export async function startAlertWorkflow(
   if (workflows.has(messageTs)) return; // already handling
 
   const incidentId = extractIncidentId(text, attachments);
+
+  // Prevent feedback loop: skip if this incident is already tracked
+  if (incidentId && isIncidentAlreadyTracked(incidentId)) {
+    console.log(`[AlertWorkflow] Incident ${incidentId} already tracked, skipping message ${messageTs}`);
+    return;
+  }
+
   const slackLink = buildSlackLink(channelId, messageTs);
 
   const workflow: ActiveWorkflow = {
@@ -96,33 +127,98 @@ export async function startAlertWorkflow(
       (incidentId ? ` (PD incident: ${incidentId})` : "")
   );
 
-  // 1. Acknowledge PagerDuty incident
+  // 1. Acknowledge PagerDuty incident (skip if already acked/resolved)
   if (incidentId && config.pagerdutyApiToken && config.pagerdutyFromEmail) {
-    const ack = await acknowledgePagerDutyIncident(
-      incidentId,
-      config.pagerdutyApiToken,
-      config.pagerdutyFromEmail
-    );
-    if (ack.success) {
-      console.log(`[AlertWorkflow] PD incident ${incidentId} acknowledged`);
+    const status = await getPagerDutyIncidentStatus(incidentId, config.pagerdutyApiToken);
+    if (status && status !== "triggered") {
+      console.log(`[AlertWorkflow] PD incident ${incidentId} already ${status}, skipping ack`);
     } else {
-      console.error(
-        `[AlertWorkflow] Failed to ack PD incident ${incidentId}: ${ack.error}`
+      const ack = await acknowledgePagerDutyIncident(
+        incidentId,
+        config.pagerdutyApiToken,
+        config.pagerdutyFromEmail
       );
+      if (ack.success) {
+        console.log(`[AlertWorkflow] PD incident ${incidentId} acknowledged`);
+      } else {
+        console.error(
+          `[AlertWorkflow] Failed to ack PD incident ${incidentId}: ${ack.error}`
+        );
+      }
     }
   }
 
-  // 2. Spawn Claude CLI to investigate
-  const prompt = `Invoke skill "${config.alertSkill}" with args "on ${slackLink}". Pre-approved to post report.`;
-  const { child, done } = spawnClaudeCli(prompt, config.paymentsRepoPath);
+  // 2. Load skill content and spawn Claude CLI to investigate
+  const skillContext = detectAndLoadSkill(config.alertSkill);
+  if (!skillContext) {
+    console.error(`[AlertWorkflow] Skill "${config.alertSkill}" not found, aborting workflow`);
+    workflows.delete(messageTs);
+    deleteWorkflow(messageTs);
+    return;
+  }
+  skillContext.skillArgs = `on ${slackLink}`;
+
+  // 2b. Post "Investigating..." indicator to thread
+  let thinkingTs: string | undefined;
+  try {
+    const res = await app.client.chat.postMessage({
+      channel: channelId,
+      thread_ts: messageTs,
+      text: "Investigating...",
+    });
+    thinkingTs = res.ts || undefined;
+  } catch (err) {
+    console.error(`[AlertWorkflow] Failed to post thinking indicator:`, err);
+  }
+
+  const prompt = `Invoke skill "${config.alertSkill}" with args "on ${slackLink}".`;
+  const { child, done } = spawnClaudeCli(prompt, config.paymentsRepoPath, { skillContext });
   workflow.cliChild = child;
 
-  // 3. When CLI finishes, start feedback timer
-  done.then((result) => {
+  // 3. When CLI finishes, post response and start feedback timer
+  done.then(async (result) => {
     workflow.cliChild = null;
     console.log(
       `[AlertWorkflow] CLI finished for thread ${messageTs} (exit: ${result.exitCode})`
     );
+
+    // Prefer fullReport (detailed investigation) over short result summary
+    const responseText = (result.fullReport || result.response
+      || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI."))
+      + buildUsageFooter(result);
+
+    try {
+      const chunks = chunkResponse(responseText);
+
+      // First chunk: update the "Investigating..." message or post new
+      if (thinkingTs) {
+        await app.client.chat.update({
+          channel: channelId,
+          ts: thinkingTs,
+          text: chunks[0],
+        });
+      } else {
+        await app.client.chat.postMessage({
+          channel: channelId,
+          thread_ts: messageTs,
+          text: chunks[0],
+        });
+      }
+
+      // Remaining chunks as thread replies
+      for (let i = 1; i < chunks.length; i++) {
+        await app.client.chat.postMessage({
+          channel: channelId,
+          thread_ts: messageTs,
+          text: chunks[i],
+        });
+      }
+
+      console.log(`[AlertWorkflow] Posted response (${chunks.length} chunk(s), ${responseText.length} chars) to thread ${messageTs}`);
+    } catch (err) {
+      console.error(`[AlertWorkflow] Failed to post response:`, err);
+    }
+
     // Only start timer if workflow is still active
     if (workflows.has(messageTs)) {
       startFeedbackTimer(app, workflow);
@@ -149,17 +245,70 @@ export async function handleOwnerFeedback(
     workflow.cliChild = null;
   }
 
-  // Spawn follow-up CLI
+  // Load skill and spawn follow-up CLI
   const slackLink = buildSlackLink(workflow.channelId, threadTs);
+  const skillContext = detectAndLoadSkill(config.alertSkill);
+  if (!skillContext) {
+    console.error(`[AlertWorkflow] Skill "${config.alertSkill}" not found for follow-up`);
+    return;
+  }
+  skillContext.skillArgs = `on ${slackLink}`;
+
+  // Post "Investigating..." indicator
+  let thinkingTs: string | undefined;
+  try {
+    const res = await app.client.chat.postMessage({
+      channel: workflow.channelId,
+      thread_ts: threadTs,
+      text: "Investigating...",
+    });
+    thinkingTs = res.ts || undefined;
+  } catch {}
+
   const prompt = `Invoke skill "${config.alertSkill}" with args "on ${slackLink}". Follow-up question from owner: ${text}`;
-  const { child, done } = spawnClaudeCli(prompt, config.paymentsRepoPath);
+  const { child, done } = spawnClaudeCli(prompt, config.paymentsRepoPath, { skillContext });
   workflow.cliChild = child;
 
-  done.then((result) => {
+  done.then(async (result) => {
     workflow.cliChild = null;
     console.log(
       `[AlertWorkflow] Follow-up CLI finished for thread ${threadTs} (exit: ${result.exitCode})`
     );
+
+    const responseText = (result.fullReport || result.response
+      || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI."))
+      + buildUsageFooter(result);
+
+    try {
+      const chunks = chunkResponse(responseText);
+
+      if (thinkingTs) {
+        await app.client.chat.update({
+          channel: workflow.channelId,
+          ts: thinkingTs,
+          text: chunks[0],
+        });
+      } else {
+        await app.client.chat.postMessage({
+          channel: workflow.channelId,
+          thread_ts: threadTs,
+          text: chunks[0],
+        });
+      }
+
+      for (let i = 1; i < chunks.length; i++) {
+        await app.client.chat.postMessage({
+          channel: workflow.channelId,
+          thread_ts: threadTs,
+          text: chunks[i],
+        });
+      }
+
+      console.log(`[AlertWorkflow] Posted follow-up response (${chunks.length} chunk(s), ${responseText.length} chars) to thread ${threadTs}`);
+    } catch (err) {
+      console.error(`[AlertWorkflow] Failed to post follow-up response:`, err);
+    }
+
     if (workflows.has(threadTs)) {
       startFeedbackTimer(app, workflow);
     }
@@ -179,8 +328,9 @@ export async function cleanupWorkflow(
   }
 
   // Spawn CLI to disconnect VPN
+  const skillContext = detectAndLoadSkill(config.alertSkill);
   const prompt = `/${config.alertSkill} off`;
-  const { done } = spawnClaudeCli(prompt, config.paymentsRepoPath);
+  const { done } = spawnClaudeCli(prompt, config.paymentsRepoPath, skillContext ? { skillContext: { ...skillContext, skillArgs: "off" } } : undefined);
   await done;
 
   // Post completion message to thread

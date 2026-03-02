@@ -1,8 +1,23 @@
 import type { App } from "@slack/bolt";
 import type { ChildProcess } from "node:child_process";
 import { config } from "../config.js";
-import { spawnClaudeCli, safeKill } from "./claude-cli.js";
+import { spawnClaudeCli, safeKill, detectAndLoadSkill, chunkResponse, type CliRunResult } from "./claude-cli.js";
 import { insertWorkflow, deleteWorkflow, getWorkflowsByType } from "./database.js";
+
+function formatTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+  return `${n}`;
+}
+
+function buildUsageFooter(result: CliRunResult): string {
+  const parts: string[] = [];
+  parts.push(`model: ${config.alertModel}`);
+  if (result.inputTokens != null) {
+    const pct = Math.round((result.inputTokens / 200_000) * 100);
+    parts.push(`context: ${formatTokens(result.inputTokens)} (${pct}%)`);
+  }
+  return `\n\n---\n_${parts.join(" | ")}_`;
+}
 
 interface DelayAlertWorkflow {
   channelId: string;
@@ -63,17 +78,74 @@ export async function startDelayAlertWorkflow(
     `[DelayAlertWorkflow] Started for Dag: ${dagName}, thread ${messageTs}`
   );
 
-  // Spawn Claude CLI to investigate using the configured skill
-  const prompt = `Invoke skill "${config.delayAlertSkill}" with args "${slackLink}". Pre-approved to post report.`;
-  const { child, done } = spawnClaudeCli(prompt, config.paymentsRepoPath);
+  // Load skill content and spawn Claude CLI to investigate
+  const skillContext = detectAndLoadSkill(config.delayAlertSkill);
+  if (!skillContext) {
+    console.error(`[DelayAlertWorkflow] Skill "${config.delayAlertSkill}" not found, aborting workflow`);
+    workflows.delete(messageTs);
+    deleteWorkflow(messageTs);
+    return;
+  }
+  skillContext.skillArgs = slackLink;
+
+  // Post "Investigating..." indicator to thread
+  let thinkingTs: string | undefined;
+  try {
+    const res = await app.client.chat.postMessage({
+      channel: channelId,
+      thread_ts: messageTs,
+      text: "Investigating...",
+    });
+    thinkingTs = res.ts || undefined;
+  } catch (err) {
+    console.error(`[DelayAlertWorkflow] Failed to post thinking indicator:`, err);
+  }
+
+  const prompt = `Invoke skill "${config.delayAlertSkill}" with args "${slackLink}".`;
+  const { child, done } = spawnClaudeCli(prompt, config.paymentsRepoPath, { skillContext });
   workflow.cliChild = child;
 
-  // When CLI finishes, start feedback timer
-  done.then((result) => {
+  // When CLI finishes, post response and start feedback timer
+  done.then(async (result) => {
     workflow.cliChild = null;
     console.log(
       `[DelayAlertWorkflow] CLI finished for Dag: ${dagName}, thread ${messageTs} (exit: ${result.exitCode})`
     );
+
+    const responseText = (result.fullReport || result.response
+      || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI."))
+      + buildUsageFooter(result);
+
+    try {
+      const chunks = chunkResponse(responseText);
+
+      if (thinkingTs) {
+        await app.client.chat.update({
+          channel: channelId,
+          ts: thinkingTs,
+          text: chunks[0],
+        });
+      } else {
+        await app.client.chat.postMessage({
+          channel: channelId,
+          thread_ts: messageTs,
+          text: chunks[0],
+        });
+      }
+
+      for (let i = 1; i < chunks.length; i++) {
+        await app.client.chat.postMessage({
+          channel: channelId,
+          thread_ts: messageTs,
+          text: chunks[i],
+        });
+      }
+
+      console.log(`[DelayAlertWorkflow] Posted response (${chunks.length} chunk(s)) to thread ${messageTs}`);
+    } catch (err) {
+      console.error(`[DelayAlertWorkflow] Failed to post response:`, err);
+    }
+
     if (workflows.has(messageTs)) {
       startFeedbackTimer(app, workflow);
     }
@@ -98,17 +170,70 @@ export async function handleDelayOwnerFeedback(
     workflow.cliChild = null;
   }
 
-  // Spawn follow-up CLI
+  // Load skill and spawn follow-up CLI
   const slackLink = buildSlackLink(workflow.channelId, threadTs);
+  const skillContext = detectAndLoadSkill(config.delayAlertSkill);
+  if (!skillContext) {
+    console.error(`[DelayAlertWorkflow] Skill "${config.delayAlertSkill}" not found for follow-up`);
+    return;
+  }
+  skillContext.skillArgs = slackLink;
+
+  // Post "Investigating..." indicator
+  let thinkingTs: string | undefined;
+  try {
+    const res = await app.client.chat.postMessage({
+      channel: workflow.channelId,
+      thread_ts: threadTs,
+      text: "Investigating...",
+    });
+    thinkingTs = res.ts || undefined;
+  } catch {}
+
   const prompt = `Invoke skill "${config.delayAlertSkill}" with args "${slackLink}". Follow-up question from owner: ${text}`;
-  const { child, done } = spawnClaudeCli(prompt, config.paymentsRepoPath);
+  const { child, done } = spawnClaudeCli(prompt, config.paymentsRepoPath, { skillContext });
   workflow.cliChild = child;
 
-  done.then((result) => {
+  done.then(async (result) => {
     workflow.cliChild = null;
     console.log(
       `[DelayAlertWorkflow] Follow-up CLI finished for thread ${threadTs} (exit: ${result.exitCode})`
     );
+
+    const responseText = (result.fullReport || result.response
+      || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI."))
+      + buildUsageFooter(result);
+
+    try {
+      const chunks = chunkResponse(responseText);
+
+      if (thinkingTs) {
+        await app.client.chat.update({
+          channel: workflow.channelId,
+          ts: thinkingTs,
+          text: chunks[0],
+        });
+      } else {
+        await app.client.chat.postMessage({
+          channel: workflow.channelId,
+          thread_ts: threadTs,
+          text: chunks[0],
+        });
+      }
+
+      for (let i = 1; i < chunks.length; i++) {
+        await app.client.chat.postMessage({
+          channel: workflow.channelId,
+          thread_ts: threadTs,
+          text: chunks[i],
+        });
+      }
+
+      console.log(`[DelayAlertWorkflow] Posted follow-up response (${chunks.length} chunk(s)) to thread ${threadTs}`);
+    } catch (err) {
+      console.error(`[DelayAlertWorkflow] Failed to post follow-up response:`, err);
+    }
+
     if (workflows.has(threadTs)) {
       startFeedbackTimer(app, workflow);
     }
