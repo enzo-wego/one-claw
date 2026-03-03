@@ -8,7 +8,7 @@ import {
   getActiveDiscussion,
 } from "../services/discuss-workflow.js";
 import { getActiveWorkflow } from "../services/alert-workflow.js";
-import { getActiveDelayWorkflow } from "../services/delay-alert-workflow.js";
+import { getActiveDelayWorkflow, cleanupDelayWorkflow } from "../services/delay-alert-workflow.js";
 import { spawnDiscussCli, detectAndLoadSkill, markdownToSlackMrkdwn } from "../services/claude-cli.js";
 import {
   downloadSlackFiles,
@@ -260,8 +260,12 @@ export function registerHandlers(
     const cleanText = stripMention(text);
     if (!cleanText) return;
 
-    // Skip if thread has active alert or delay-alert workflow
-    if (getActiveWorkflow(threadTs) || getActiveDelayWorkflow(threadTs)) return;
+    // Skip if thread has active alert or delay-alert workflow (but allow !exit/!compact through)
+    const activeAlertOrDelay = getActiveWorkflow(threadTs) || getActiveDelayWorkflow(threadTs);
+    if (activeAlertOrDelay) {
+      const gateCmd = cleanText.trim().toLowerCase();
+      if (gateCmd !== "!exit" && gateCmd !== "!compact") return;
+    }
 
     // Gemini routing: "use gemini ..."
     if (detectGeminiRequest(cleanText)) {
@@ -350,9 +354,16 @@ export function registerHandlers(
       return;
     }
 
-    if (cmd === "!exit" && activeDiscussion) {
-      await handleDiscussExit(app, threadTs);
-      return;
+    if (cmd === "!exit") {
+      if (activeDiscussion) {
+        await handleDiscussExit(app, threadTs);
+        return;
+      }
+      const delayWf = getActiveDelayWorkflow(threadTs);
+      if (delayWf) {
+        await cleanupDelayWorkflow(app, delayWf);
+        return;
+      }
     }
 
     const filePrefix = await extractFilePrefix(msg.files as SlackFile[] | undefined);

@@ -5,6 +5,7 @@ import {
   handleDelayOwnerFeedback,
   getActiveDelayWorkflow,
   isWorkflowActiveForDag,
+  cleanupDelayWorkflow,
 } from "../services/delay-alert-workflow.js";
 import {
   upsertAlertCounter,
@@ -145,6 +146,14 @@ export function registerDelayAlertMonitor(app: App, ownerUserId: string, botUser
 
     // Thread reply from owner on an active workflow → handle feedback
     if (threadTs && msg.user === ownerUserId && getActiveDelayWorkflow(threadTs) && text.includes(`<@${botUserId}>`)) {
+      const stripped = text.replace(/<@[A-Z0-9]+>/g, "").trim().toLowerCase();
+
+      if (stripped === "!exit") {
+        const workflow = getActiveDelayWorkflow(threadTs)!;
+        await cleanupDelayWorkflow(app, workflow);
+        return;
+      }
+
       await handleDelayOwnerFeedback(app, threadTs, text);
       return;
     }
