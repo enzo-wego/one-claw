@@ -102,6 +102,12 @@ function convertSegment(text: string): string {
     }
   );
 
+  // 7. Emoji shortcodes: fix common ones Claude generates that Slack doesn't recognize
+  text = text.replace(/:green_circle:/g, ":large_green_circle:");
+  text = text.replace(/:red_circle:/g, ":red_circle:");
+  text = text.replace(/:orange_circle:/g, ":large_orange_circle:");
+  text = text.replace(/:yellow_circle:/g, ":large_yellow_circle:");
+
   return text;
 }
 
@@ -178,14 +184,47 @@ const SKILL_SYSTEM_PROMPT =
 /** Build the effective prompt with full SKILL.md content injected */
 function buildSkillPrompt(skillContext: SkillContext, fallbackPrompt: string): string {
   const { skillName, skillContent, skillArgs } = skillContext;
+  const subSkillRefs = loadSubSkillReferences(skillContent);
   return (
     `Execute skill "${skillName}" with arguments "${skillArgs}".\n\n` +
-    `<skill>\n${skillContent}\n</skill>\n\n` +
+    `<skill>\n${skillContent}\n</skill>${subSkillRefs}\n\n` +
     `IMPORTANT: Follow every step in the skill workflow exactly in order. ` +
     `Do NOT skip any step. Many steps have infrastructure prerequisites ` +
     `(SSO login, VPN tunnels via sshuttle, browser authorization) that MUST ` +
     `complete before any API/MCP tool calls.`
   );
+}
+
+function loadSubSkillReferences(skillContent: string): string {
+  // Find all Skill(one:xxx, ...) references in skill content
+  const skillRefs = new Set<string>();
+  const pattern = /Skill\(one:([a-z][a-z0-9-]*)/gi;
+  let match;
+  while ((match = pattern.exec(skillContent)) !== null) {
+    skillRefs.add(match[1]);
+  }
+
+  if (skillRefs.size === 0) return "";
+
+  const refs: string[] = [];
+  for (const name of skillRefs) {
+    const refPath = path.join(config.skillsDir, name, "SKILL.md");
+    try {
+      const content = readFileSync(refPath, "utf-8");
+      refs.push(`<skill-reference name="${name}">\n${content}\n</skill-reference>`);
+      console.log(`[ClaudeCLI] Loaded sub-skill reference: ${name}`);
+    } catch {
+      console.log(`[ClaudeCLI] Sub-skill "${name}" not found at ${refPath}, skipping`);
+    }
+  }
+
+  return refs.length > 0
+    ? "\n\n<sub-skill-references>\n" +
+      "The following skills are referenced in the workflow above. " +
+      "Use their schema knowledge and query patterns when making Athena queries directly.\n\n" +
+      refs.join("\n\n") +
+      "\n</sub-skill-references>"
+    : "";
 }
 
 export function spawnClaudeCli(

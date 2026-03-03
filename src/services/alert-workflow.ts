@@ -1,5 +1,7 @@
 import type { App } from "@slack/bolt";
 import type { ChildProcess } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { config } from "../config.js";
 import { acknowledgePagerDutyIncident, getPagerDutyIncidentStatus } from "./pagerduty.js";
 import { spawnClaudeCli, safeKill, detectAndLoadSkill, chunkResponse, markdownToSlackMrkdwn, type CliRunResult } from "./claude-cli.js";
@@ -18,6 +20,32 @@ function buildUsageFooter(result: CliRunResult): string {
     parts.push(`context: ${formatTokens(result.inputTokens)} (${pct}%)`);
   }
   return `\n\n---\n_${parts.join(" | ")}_`;
+}
+
+/** Extract the summary (header + section 1) from the full report markdown. */
+function extractSummary(text: string): { summary: string; fullReport: string } {
+  // Split at the "---" boundary before section 2 (e.g. "## 2." or "2. What happened")
+  const match = text.match(/\n---\n+(?=(?:#{1,3}\s+)?2\.\s)/);
+  if (match?.index != null) {
+    return { summary: text.slice(0, match.index).trimEnd(), fullReport: text };
+  }
+  return { summary: text, fullReport: text };
+}
+
+/** Save the full investigation report to data/reports/ and return the file path. */
+function saveFullReport(threadTs: string, text: string): string | undefined {
+  try {
+    const reportsDir = path.join("data", "reports");
+    mkdirSync(reportsDir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const filePath = path.join(reportsDir, `${ts}-${threadTs}.md`);
+    writeFileSync(filePath, text, "utf-8");
+    console.log(`[AlertWorkflow] Full report saved to ${filePath} (${text.length} chars)`);
+    return filePath;
+  } catch (err) {
+    console.error(`[AlertWorkflow] Failed to save report:`, err);
+    return undefined;
+  }
 }
 
 interface ActiveWorkflow {
@@ -185,10 +213,15 @@ export async function startAlertWorkflow(
     // Prefer fullReport (detailed investigation) over short result summary
     const rawText = result.fullReport || result.response
       || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI.");
-    const responseText = markdownToSlackMrkdwn(rawText) + buildUsageFooter(result);
+
+    // Extract summary (header + section 1) for Slack, save full report to file
+    const { summary } = extractSummary(rawText);
+    const reportPath = saveFullReport(messageTs, rawText);
+    const summaryText = markdownToSlackMrkdwn(summary) + buildUsageFooter(result);
 
     try {
-      const chunks = chunkResponse(responseText);
+      // Post summary to Slack
+      const chunks = chunkResponse(summaryText);
 
       // First chunk: update the "Investigating..." message or post new
       if (thinkingTs) {
@@ -242,7 +275,24 @@ export async function startAlertWorkflow(
         }
       }
 
-      console.log(`[AlertWorkflow] Posted response (${chunks.length} chunk(s), ${responseText.length} chars) to thread ${messageTs}`);
+      // Upload full report as file snippet in thread
+      if (reportPath) {
+        try {
+          await app.client.filesUploadV2({
+            channel_id: channelId,
+            thread_ts: messageTs,
+            content: rawText,
+            filename: path.basename(reportPath),
+            title: "Full Investigation Report",
+            initial_comment: "_Full report attached above._",
+          });
+          console.log(`[AlertWorkflow] Uploaded full report to thread ${messageTs}`);
+        } catch (uploadErr) {
+          console.error(`[AlertWorkflow] Failed to upload report file:`, uploadErr);
+        }
+      }
+
+      console.log(`[AlertWorkflow] Posted summary (${chunks.length} chunk(s), ${summaryText.length} chars) to thread ${messageTs}`);
     } catch (err) {
       console.error(`[AlertWorkflow] Failed to post response:`, err);
     }
@@ -381,23 +431,6 @@ export async function cleanupWorkflow(
   if (workflow.cliChild) {
     safeKill(workflow.cliChild);
     workflow.cliChild = null;
-  }
-
-  // Spawn CLI to disconnect VPN
-  const skillContext = detectAndLoadSkill(config.alertSkill);
-  const prompt = `/${config.alertSkill} off`;
-  const { done } = spawnClaudeCli(prompt, config.paymentsRepoPath, skillContext ? { skillContext: { ...skillContext, skillArgs: "off" } } : undefined);
-  await done;
-
-  // Post completion message to thread
-  try {
-    await app.client.chat.postMessage({
-      channel: workflow.channelId,
-      thread_ts: workflow.threadTs,
-      text: "Investigation complete. VPN disconnected.",
-    });
-  } catch (err) {
-    console.error(`[AlertWorkflow] Failed to post cleanup message:`, err);
   }
 
   workflows.delete(workflow.threadTs);

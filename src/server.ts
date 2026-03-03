@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { App } from "@slack/bolt";
+import { config } from "./config.js";
 import { getAllDiscussions, killDiscussSession } from "./services/discuss-workflow.js";
 import { getAllAlertWorkflows, killAlertWorkflow, startAlertWorkflow, isAlertWorkflowActive } from "./services/alert-workflow.js";
 import { getAllDelayWorkflows, killDelayWorkflow, startDelayAlertWorkflow, getActiveDelayWorkflow } from "./services/delay-alert-workflow.js";
@@ -175,6 +176,45 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 function jsonError(res: ServerResponse, status: number, error: string): void {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error }));
+}
+
+async function handleDeleteMessage(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") { jsonError(res, 405, "POST only"); return; }
+
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    jsonError(res, 400, "invalid JSON body"); return;
+  }
+
+  const url = body.url;
+  if (typeof url !== "string" || !url) { jsonError(res, 400, "missing url"); return; }
+
+  const parsed = parseSlackUrl(url);
+  if (!parsed) { jsonError(res, 400, "invalid Slack URL"); return; }
+
+  const { channelId, messageTs } = parsed;
+
+  try {
+    const slackRes = await fetch("https://slack.com/api/chat.delete", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${config.slackBotToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ channel: channelId, ts: messageTs }),
+    });
+    const data = await slackRes.json() as { ok: boolean; error?: string };
+    if (!data.ok) {
+      jsonError(res, 400, `Slack API error: ${data.error}`); return;
+    }
+  } catch (err) {
+    jsonError(res, 500, `failed to call Slack API: ${err}`); return;
+  }
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ ok: true, channel: channelId, ts: messageTs }));
 }
 
 async function handleTriggerAlert(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -447,6 +487,47 @@ const openApiSpec = {
         },
       },
     },
+    "/delete-message": {
+      post: {
+        summary: "Delete a Slack message",
+        description: "Deletes a Slack message by its URL. Parses the URL to extract channel and timestamp, then calls Slack chat.delete API.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["url"],
+                properties: {
+                  url: { type: "string", example: "https://wego.slack.com/archives/C08S954G2LX/p1772530814524819" },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Message deleted",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    ok: { type: "boolean", example: true },
+                    channel: { type: "string", example: "C08S954G2LX" },
+                    ts: { type: "string", example: "1772530814.524819" },
+                  },
+                },
+              },
+            },
+          },
+          "400": {
+            description: "Invalid request (missing/invalid URL, Slack API error)",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+        },
+      },
+    },
     "/trigger-alert": {
       post: {
         summary: "Trigger alert investigation",
@@ -589,6 +670,7 @@ export function startHttpServer(port: number): void {
       return handleKillSession(threadTs, res);
     }
     if (req.url === "/daily-summary") return handleDailySummary(req, res);
+    if (req.url === "/delete-message") return void handleDeleteMessage(req, res);
     if (req.url === "/trigger-alert") return void handleTriggerAlert(req, res);
     if (req.url === "/trigger-delay-alert") return void handleTriggerDelayAlert(req, res);
     if (req.url === "/") return handleIndex(req, res);
