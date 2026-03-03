@@ -244,6 +244,13 @@ export function spawnClaudeCli(
   if (options?.skillContext) {
     systemPrompt = SKILL_SYSTEM_PROMPT;
     args.push("--append-system-prompt", systemPrompt);
+    // Hard-block Slack write tools — the model can ignore system prompt rules,
+    // but --disallowedTools is enforced by the CLI runtime.
+    args.push(
+      "--disallowedTools",
+      "mcp__slack__conversations_add_message",
+      "mcp__claude_ai_Slack__slack_post_message",
+    );
   }
 
   const mcpOverride = getMcpConfigPath();

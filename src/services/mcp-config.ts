@@ -52,7 +52,7 @@ export function detectMcpOverrides(): string | null {
   }
 
   // Write override config to a temp file in the project data directory
-  const overridePath = path.join(path.dirname(config.databasePath), "mcp-override.json");
+  const overridePath = path.resolve(path.dirname(config.databasePath), "mcp-override.json");
   writeFileSync(overridePath, JSON.stringify({ mcpServers: overrides }, null, 2));
   console.log(`[MCP] Override config written to ${overridePath}`);
 
