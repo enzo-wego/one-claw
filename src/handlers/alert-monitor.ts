@@ -4,6 +4,7 @@ import {
   startAlertWorkflow,
   handleOwnerFeedback,
   getActiveWorkflow,
+  cleanupWorkflow,
 } from "../services/alert-workflow.js";
 
 /** Map of channel name → channel ID, populated at startup */
@@ -121,9 +122,15 @@ export function registerAlertMonitor(app: App, ownerUserId: string, botUserId: s
       return;
     }
 
-    // Thread reply from owner on an active workflow → handle feedback
+    // Thread reply from owner on an active workflow → handle feedback or exit
     if (threadTs && msg.user === ownerUserId && getActiveWorkflow(threadTs) && text.includes(`<@${botUserId}>`)) {
-      await handleOwnerFeedback(app, threadTs, text);
+      const cmd = text.replace(/<@[^>]+>/g, "").trim().toLowerCase();
+      if (cmd === "!exit") {
+        console.log(`[AlertMonitor] Owner requested !exit on thread ${threadTs}`);
+        await cleanupWorkflow(app, getActiveWorkflow(threadTs)!);
+      } else {
+        await handleOwnerFeedback(app, threadTs, text);
+      }
     }
   });
 }
