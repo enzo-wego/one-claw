@@ -213,12 +213,17 @@ export function registerHandlers(
     // Non-owner: only respond if they @mention the bot, with a polite decline
     if (!isOwner) {
       if (hasMention) {
+        console.log(`[Message] Non-owner @mention from ${userId} in ${msg.channel} — declining`);
         const threadTs = (msg.thread_ts || msg.ts) as string;
-        await app.client.chat.postMessage({
-          channel: msg.channel,
-          ...(isDm ? {} : { thread_ts: threadTs }),
-          text: `To save Claude tokens, I only reply for <@${ownerUserId}>.`,
-        });
+        try {
+          await app.client.chat.postMessage({
+            channel: msg.channel,
+            ...(isDm ? {} : { thread_ts: threadTs }),
+            text: `To save Claude tokens, I only reply for <@${ownerUserId}>.`,
+          });
+        } catch (err) {
+          console.error("[Message] Failed to post non-owner decline:", err);
+        }
       }
       return;
     }

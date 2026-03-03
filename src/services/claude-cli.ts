@@ -124,7 +124,8 @@ const SKILL_SYSTEM_PROMPT =
   "2. Many skills have infrastructure prerequisites (SSO login, VPN tunnels via sshuttle, browser authorization). These MUST complete before any API/MCP tool calls. If you skip tunnel setup, API calls WILL timeout because servers are behind a VPN.\n" +
   "3. Do not check or use the current git branch unless the skill explicitly instructs you to.\n" +
   "4. If a step fails, report the failure — do NOT skip ahead to later steps.\n" +
-  "5. Your final response MUST be the investigation report itself — do NOT follow the report with a brief summary. The report IS the final output.";
+  "5. Your final response MUST be the investigation report itself — do NOT follow the report with a brief summary. The report IS the final output.\n" +
+  "6. Do NOT post or write messages to Slack. Your job is to investigate and return the report as your final text response. The bot will handle posting the report to the correct Slack thread. You MAY use Slack MCP tools to READ messages and threads for investigation.";
 
 /** Build the effective prompt with full SKILL.md content injected */
 function buildSkillPrompt(skillContext: SkillContext, fallbackPrompt: string): string {

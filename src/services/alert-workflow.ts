@@ -192,11 +192,25 @@ export async function startAlertWorkflow(
 
       // First chunk: update the "Investigating..." message or post new
       if (thinkingTs) {
-        await app.client.chat.update({
-          channel: channelId,
-          ts: thinkingTs,
-          text: chunks[0],
-        });
+        try {
+          await app.client.chat.update({
+            channel: channelId,
+            ts: thinkingTs,
+            text: chunks[0],
+          });
+        } catch (updateErr: any) {
+          if (updateErr?.data?.error === "msg_too_long") {
+            console.warn(`[AlertWorkflow] msg_too_long on update, truncating chunk (${chunks[0].length} chars)`);
+            const truncated = chunks[0].slice(0, 3800) + "\n\n_(truncated)_";
+            await app.client.chat.update({
+              channel: channelId,
+              ts: thinkingTs,
+              text: truncated,
+            });
+          } else {
+            throw updateErr;
+          }
+        }
       } else {
         await app.client.chat.postMessage({
           channel: channelId,
@@ -207,11 +221,25 @@ export async function startAlertWorkflow(
 
       // Remaining chunks as thread replies
       for (let i = 1; i < chunks.length; i++) {
-        await app.client.chat.postMessage({
-          channel: channelId,
-          thread_ts: messageTs,
-          text: chunks[i],
-        });
+        try {
+          await app.client.chat.postMessage({
+            channel: channelId,
+            thread_ts: messageTs,
+            text: chunks[i],
+          });
+        } catch (postErr: any) {
+          if (postErr?.data?.error === "msg_too_long") {
+            console.warn(`[AlertWorkflow] msg_too_long on chunk ${i}, truncating (${chunks[i].length} chars)`);
+            const truncated = chunks[i].slice(0, 3800) + "\n\n_(truncated)_";
+            await app.client.chat.postMessage({
+              channel: channelId,
+              thread_ts: messageTs,
+              text: truncated,
+            });
+          } else {
+            throw postErr;
+          }
+        }
       }
 
       console.log(`[AlertWorkflow] Posted response (${chunks.length} chunk(s), ${responseText.length} chars) to thread ${messageTs}`);
@@ -283,11 +311,25 @@ export async function handleOwnerFeedback(
       const chunks = chunkResponse(responseText);
 
       if (thinkingTs) {
-        await app.client.chat.update({
-          channel: workflow.channelId,
-          ts: thinkingTs,
-          text: chunks[0],
-        });
+        try {
+          await app.client.chat.update({
+            channel: workflow.channelId,
+            ts: thinkingTs,
+            text: chunks[0],
+          });
+        } catch (updateErr: any) {
+          if (updateErr?.data?.error === "msg_too_long") {
+            console.warn(`[AlertWorkflow] msg_too_long on follow-up update, truncating chunk (${chunks[0].length} chars)`);
+            const truncated = chunks[0].slice(0, 3800) + "\n\n_(truncated)_";
+            await app.client.chat.update({
+              channel: workflow.channelId,
+              ts: thinkingTs,
+              text: truncated,
+            });
+          } else {
+            throw updateErr;
+          }
+        }
       } else {
         await app.client.chat.postMessage({
           channel: workflow.channelId,
@@ -297,11 +339,25 @@ export async function handleOwnerFeedback(
       }
 
       for (let i = 1; i < chunks.length; i++) {
-        await app.client.chat.postMessage({
-          channel: workflow.channelId,
-          thread_ts: threadTs,
-          text: chunks[i],
-        });
+        try {
+          await app.client.chat.postMessage({
+            channel: workflow.channelId,
+            thread_ts: threadTs,
+            text: chunks[i],
+          });
+        } catch (postErr: any) {
+          if (postErr?.data?.error === "msg_too_long") {
+            console.warn(`[AlertWorkflow] msg_too_long on follow-up chunk ${i}, truncating (${chunks[i].length} chars)`);
+            const truncated = chunks[i].slice(0, 3800) + "\n\n_(truncated)_";
+            await app.client.chat.postMessage({
+              channel: workflow.channelId,
+              thread_ts: threadTs,
+              text: truncated,
+            });
+          } else {
+            throw postErr;
+          }
+        }
       }
 
       console.log(`[AlertWorkflow] Posted follow-up response (${chunks.length} chunk(s), ${responseText.length} chars) to thread ${threadTs}`);
