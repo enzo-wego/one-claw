@@ -2,7 +2,7 @@ import type { App } from "@slack/bolt";
 import type { ChildProcess } from "node:child_process";
 import { config } from "../config.js";
 import { acknowledgePagerDutyIncident, getPagerDutyIncidentStatus } from "./pagerduty.js";
-import { spawnClaudeCli, safeKill, detectAndLoadSkill, chunkResponse, type CliRunResult } from "./claude-cli.js";
+import { spawnClaudeCli, safeKill, detectAndLoadSkill, chunkResponse, markdownToSlackMrkdwn, type CliRunResult } from "./claude-cli.js";
 import { insertWorkflow, deleteWorkflow, getWorkflowsByType } from "./database.js";
 
 function formatTokens(n: number): string {
@@ -183,9 +183,9 @@ export async function startAlertWorkflow(
     );
 
     // Prefer fullReport (detailed investigation) over short result summary
-    const responseText = (result.fullReport || result.response
-      || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI."))
-      + buildUsageFooter(result);
+    const rawText = result.fullReport || result.response
+      || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI.");
+    const responseText = markdownToSlackMrkdwn(rawText) + buildUsageFooter(result);
 
     try {
       const chunks = chunkResponse(responseText);
@@ -303,9 +303,9 @@ export async function handleOwnerFeedback(
       `[AlertWorkflow] Follow-up CLI finished for thread ${threadTs} (exit: ${result.exitCode})`
     );
 
-    const responseText = (result.fullReport || result.response
-      || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI."))
-      + buildUsageFooter(result);
+    const rawFollowUpText = result.fullReport || result.response
+      || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI.");
+    const responseText = markdownToSlackMrkdwn(rawFollowUpText) + buildUsageFooter(result);
 
     try {
       const chunks = chunkResponse(responseText);

@@ -7,7 +7,9 @@ import {
   detectAndLoadSkill,
   safeKill,
   chunkResponse,
+  markdownToSlackMrkdwn,
   type DiscussCliResult,
+  type SkillContext,
 } from "./claude-cli.js";
 import { insertWorkflow, updateWorkflowCliSession, deleteWorkflow, getWorkflowsByType } from "./database.js";
 
@@ -115,7 +117,7 @@ async function runDiscussCliWithHeartbeat(
       console.log(`[Discuss] CLI error for thread ${threadTs} (exit: ${result.exitCode})`);
     } else {
       const response = result.response || "No response from Claude CLI.";
-      fullText = response + buildUsageFooter(result);
+      fullText = markdownToSlackMrkdwn(response) + buildUsageFooter(result);
       console.log(
         `[Discuss] CLI done for thread ${threadTs} ` +
           `(exit: ${result.exitCode}, session: ${result.sessionId || "none"})`
@@ -164,7 +166,8 @@ export async function startDiscussSession(
   app: App,
   channelId: string,
   messageTs: string,
-  text: string
+  text: string,
+  predetectedSkill?: SkillContext
 ): Promise<void> {
   if (discussions.has(messageTs)) return;
 
@@ -196,7 +199,7 @@ export async function startDiscussSession(
     console.error(`[Discuss] Failed to post thinking indicator:`, err);
   }
 
-  const skillContext = detectAndLoadSkill(cleanText) ?? undefined;
+  const skillContext = predetectedSkill ?? detectAndLoadSkill(cleanText) ?? undefined;
   const { child, done } = spawnDiscussCli(cleanText, config.paymentsRepoPath, {
     model: config.discussModel,
     skillContext,

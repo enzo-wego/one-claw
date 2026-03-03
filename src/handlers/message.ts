@@ -9,7 +9,7 @@ import {
 } from "../services/discuss-workflow.js";
 import { getActiveWorkflow } from "../services/alert-workflow.js";
 import { getActiveDelayWorkflow } from "../services/delay-alert-workflow.js";
-import { spawnDiscussCli, detectAndLoadSkill } from "../services/claude-cli.js";
+import { spawnDiscussCli, detectAndLoadSkill, markdownToSlackMrkdwn } from "../services/claude-cli.js";
 import {
   downloadSlackFiles,
   buildFilePromptPrefix,
@@ -63,7 +63,7 @@ function buildGeminiContext(threadTs: string): string {
 }
 
 function formatGeminiResponse(result: { text: string; sources: { title: string; url: string }[] }, model: string): string {
-  let msg = `*Gemini (${model}):*\n${result.text}`;
+  let msg = `*Gemini (${model}):*\n${markdownToSlackMrkdwn(result.text)}`;
   if (result.sources.length > 0) {
     msg += "\n\n*Sources:*\n";
     const seen = new Set<string>();
@@ -106,17 +106,36 @@ async function fetchThreadContext(
       oldest: lastSeenTs || undefined,
     });
 
+    const isNewSession = !lastSeenTs;
+    const BOT_MSG_LIMIT = 500;
+
     const messages = (res.messages || [])
       .filter((m) => {
-        if (m.bot_id || m.user === botUserId) return false;
-        if (m.ts === threadTs && !lastSeenTs) return false; // skip root if starting fresh
-        if (lastSeenTs && m.ts && m.ts <= lastSeenTs) return false;
+        // For follow-ups in active sessions: only non-bot messages since lastSeenTs
+        if (!isNewSession) {
+          if (m.bot_id || m.user === botUserId) return false;
+          if (m.ts && m.ts <= lastSeenTs!) return false;
+          return true;
+        }
+        // For new sessions: include everything (root, bots, users)
         return true;
       })
-      .map((m) => `<@${m.user}>: ${m.text || ""}`.trim());
+      .map((m) => {
+        const isBot = !!(m.bot_id || m.user === botUserId);
+        const text = m.text || "";
+        // Truncate long bot messages to keep prompt reasonable
+        const displayText = isBot && text.length > BOT_MSG_LIMIT
+          ? text.slice(0, BOT_MSG_LIMIT) + "... [truncated]"
+          : text;
+        const prefix = isBot ? "[bot]" : `<@${m.user}>`;
+        return `${prefix}: ${displayText}`.trim();
+      });
 
     if (messages.length === 0) return "";
-    return "Thread context (messages from other users):\n" + messages.join("\n") + "\n\n";
+    const label = isNewSession
+      ? "Thread history (previous messages in this thread):\n"
+      : "Thread context (messages from other users):\n";
+    return label + messages.join("\n") + "\n\n";
   } catch (err) {
     console.error("[Message] Failed to fetch thread context:", err);
     return "";
@@ -156,7 +175,7 @@ async function handleDm(
     });
     const result = await done;
 
-    const response = result.response || "No response from Claude CLI.";
+    const response = markdownToSlackMrkdwn(result.response || "No response from Claude CLI.");
 
     if (thinkingTs) {
       await app.client.chat.update({
@@ -316,7 +335,8 @@ export function registerHandlers(
         // No active session → start a new one with Gemini context
         const context = await fetchThreadContext(app, msg.channel, threadTs, null, botUserId);
         const prompt = filePrefix + context + geminiContext + (resumeText || "Continue our task based on the Gemini analysis above.");
-        await startDiscussSession(app, msg.channel, threadTs, prompt);
+        const skill = detectAndLoadSkill(resumeText || "") ?? undefined;
+        await startDiscussSession(app, msg.channel, threadTs, prompt, skill);
       }
       return;
     }
@@ -354,6 +374,7 @@ export function registerHandlers(
     // No active session → start new discuss session with thread context
     const context = await fetchThreadContext(app, msg.channel, threadTs, null, botUserId);
     const prompt = filePrefix + context + cleanText;
-    await startDiscussSession(app, msg.channel, threadTs, prompt);
+    const skill = detectAndLoadSkill(cleanText) ?? undefined;
+    await startDiscussSession(app, msg.channel, threadTs, prompt, skill);
   });
 }

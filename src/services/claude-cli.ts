@@ -57,6 +57,54 @@ export function chunkResponse(text: string, maxLength = SLACK_MAX_LENGTH): strin
   return chunks;
 }
 
+/** Convert standard Markdown to Slack mrkdwn format.
+ *  Splits on fenced code blocks — only transforms non-code segments. */
+export function markdownToSlackMrkdwn(text: string): string {
+  // Split on fenced code blocks (```...```)
+  const parts = text.split(/(```[\s\S]*?```)/);
+  return parts
+    .map((part, i) => {
+      // Odd indices are code blocks — leave untouched
+      if (i % 2 === 1) return part;
+      return convertSegment(part);
+    })
+    .join("");
+}
+
+function convertSegment(text: string): string {
+  // 1. Images: ![alt](url) → <url|alt>
+  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, "<$2|$1>");
+
+  // 2. Links: [text](url) → <url|text>
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<$2|$1>");
+
+  // 3. Headings: ^#{1,6} text → *text* (bold, strip any ** inside)
+  text = text.replace(/^#{1,6}\s+(.+)$/gm, (_match, heading: string) => {
+    return `*${heading.replace(/\*\*/g, "")}*`;
+  });
+
+  // 4. Bold: **text** → *text*
+  text = text.replace(/\*\*(.+?)\*\*/g, "*$1*");
+
+  // 5. Strikethrough: ~~text~~ → ~text~
+  text = text.replace(/~~(.+?)~~/g, "~$1~");
+
+  // 6. Tables: consecutive |...| lines → wrapped in ``` code block (separator rows removed)
+  text = text.replace(
+    /(?:^[ \t]*\|.+\|[ \t]*$\n?){2,}/gm,
+    (tableBlock: string) => {
+      const lines = tableBlock
+        .split("\n")
+        .filter((line) => line.trim() !== "")
+        // Remove separator rows like |---|---|
+        .filter((line) => !/^\s*\|[\s:|-]+\|\s*$/.test(line));
+      return "```\n" + lines.join("\n") + "\n```\n";
+    }
+  );
+
+  return text;
+}
+
 const STREAM_LOG_TEXT_LIMIT = 200;
 
 function logStreamContent(tag: string, content: unknown[]): void {
