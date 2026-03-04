@@ -24,15 +24,10 @@ function buildUsageFooter(result: CliRunResult): string {
 
 /** Extract the summary (header + section 1) from the full report markdown. */
 function extractSummary(text: string): { summary: string; fullReport: string } {
-  // Split before section 2 (e.g. "## 2." or "2. What happened")
-  // Try with "---" boundary first, then fall back to splitting at section 2 directly
-  const withSeparator = text.match(/\n---\n+(?=(?:#{1,3}\s+)?2\.\s)/);
-  if (withSeparator?.index != null) {
-    return { summary: text.slice(0, withSeparator.index).trimEnd(), fullReport: text };
-  }
-  const atSection2 = text.match(/\n+(?=(?:#{1,3}\s+)?2\.\s)/);
-  if (atSection2?.index != null) {
-    return { summary: text.slice(0, atSection2.index).trimEnd(), fullReport: text };
+  // Split at the first "---" separator to get just the header + one-liner summary
+  const firstSeparator = text.match(/\n---\n/);
+  if (firstSeparator?.index != null) {
+    return { summary: text.slice(0, firstSeparator.index).trimEnd(), fullReport: text };
   }
   return { summary: text, fullReport: text };
 }
