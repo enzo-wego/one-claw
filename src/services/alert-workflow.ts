@@ -159,7 +159,10 @@ export async function startAlertWorkflow(
   if (incidentId && config.pagerdutyApiToken && config.pagerdutyFromEmail) {
     const status = await getPagerDutyIncidentStatus(incidentId, config.pagerdutyApiToken);
     if (status && status !== "triggered") {
-      console.log(`[AlertWorkflow] PD incident ${incidentId} already ${status}, skipping ack`);
+      console.log(`[AlertWorkflow] PD incident ${incidentId} already ${status}, skipping investigation`);
+      workflows.delete(messageTs);
+      deleteWorkflow(messageTs);
+      return;
     } else {
       const ack = await acknowledgePagerDutyIncident(
         incidentId,

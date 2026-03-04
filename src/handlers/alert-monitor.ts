@@ -100,6 +100,10 @@ function isMonitoredChannel(channelId: string): boolean {
 export function registerAlertMonitor(app: App, ownerUserId: string, botUserId: string): void {
   app.message(async ({ message }) => {
     const msg = message as unknown as Record<string, unknown>;
+
+    // Skip message edits and other subtypes (joins, etc.)
+    if (msg.subtype) return;
+
     const channelId = msg.channel as string;
 
     if (!isMonitoredChannel(channelId)) return;
