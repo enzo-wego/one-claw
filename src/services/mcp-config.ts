@@ -36,18 +36,19 @@ export function detectMcpOverrides(): string | null {
   const overrides: Record<string, any> = {};
 
   for (const name of config.requiredMcpServers) {
-    if (disabled.has(name) && mcpServers[name]) {
-      console.log(`[MCP] Required server "${name}" is disabled — will force-enable via --mcp-config`);
-      overrides[name] = mcpServers[name];
-    } else if (!mcpServers[name]) {
+    if (!mcpServers[name]) {
       console.warn(`[MCP] Required server "${name}" not configured in project`);
+    } else if (disabled.has(name)) {
+      console.log(`[MCP] Required server "${name}" is disabled — force-enabling via --mcp-config`);
+      overrides[name] = mcpServers[name];
     } else {
-      console.log(`[MCP] Required server "${name}" is enabled`);
+      console.log(`[MCP] Required server "${name}" — including in --mcp-config for subprocess access`);
+      overrides[name] = mcpServers[name];
     }
   }
 
   if (Object.keys(overrides).length === 0) {
-    console.log("[MCP] All required servers enabled, no override needed");
+    console.log("[MCP] No required servers found in project config");
     return null;
   }
 

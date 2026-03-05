@@ -17,6 +17,26 @@ function csvList(name: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Parse daily summary channels as "name:ID" pairs.
+ * Format: "ai-team-core:C0ABAK2NKQR,general:C012345"
+ */
+function namedChannelList(name: string): { name: string; id: string }[] {
+  return (process.env[name] || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [channelName, channelId] = entry.split(":");
+      if (!channelId) {
+        throw new Error(
+          `Invalid DAILY_SUMMARY_CHANNELS format: "${entry}". Expected "name:ID" (e.g. "ai-team-core:C0ABAK2NKQR")`
+        );
+      }
+      return { name: channelName, id: channelId };
+    });
+}
+
 function channelList(name: string): { enabled: string[]; disabled: string[] } {
   const raw = (process.env[name] || "").split(",").map((s) => s.trim()).filter(Boolean);
   const enabled: string[] = [];
@@ -39,9 +59,9 @@ export const config = {
   port: parseInt(process.env.PORT || "3000", 10),
   ownerUserId: required("OWNER_USER_ID"),
 
-  // Channel configuration (comma-separated channel names)
+  // Channel configuration
   channels: {
-    dailySummary: csvList("DAILY_SUMMARY_CHANNELS"),
+    dailySummary: namedChannelList("DAILY_SUMMARY_CHANNELS"),
     monitor: channelList("MONITOR_CHANNELS"),
     monitorDelay: channelList("MONITOR_DELAY_CHANNELS"),
   },
@@ -91,7 +111,7 @@ export const config = {
   // MCP servers required by alert skills (auto-detected from ~/.claude.json)
   requiredMcpServers: csvList("REQUIRED_MCP_SERVERS").length > 0
     ? csvList("REQUIRED_MCP_SERVERS")
-    : ["chrome-devtools", "athena", "atlassian", "slack"],
+    : ["athena", "atlassian", "slack"],
   claudeConfigPath: process.env.CLAUDE_CONFIG_PATH || path.join(os.homedir(), ".claude.json"),
 
   // Skills directory for skill detection and injection
@@ -99,4 +119,8 @@ export const config = {
 
   // Gemini API
   geminiApiKey: process.env.GEMINI_API_KEY || "",
+
+  // Personal Slack credentials (xoxc/xoxd) for direct channel reading
+  slackXoxcToken: process.env.SLACK_XOXC_TOKEN || "",
+  slackXoxdToken: process.env.SLACK_XOXD_TOKEN || "",
 };

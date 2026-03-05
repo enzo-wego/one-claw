@@ -69,7 +69,7 @@ function triggerDailySummary(): void {
     sendDm: async (userId: string, text: string) => {
       const MAX_LENGTH = 3900;
       if (text.length <= MAX_LENGTH) {
-        await app.client.chat.postMessage({ channel: userId, text });
+        await app.client.chat.postMessage({ channel: userId, text, unfurl_links: false, unfurl_media: false });
         return;
       }
 
@@ -93,6 +93,8 @@ function triggerDailySummary(): void {
       const first = await app.client.chat.postMessage({
         channel: userId,
         text: chunks[0],
+        unfurl_links: false,
+        unfurl_media: false,
       });
       const threadTs = first.ts;
 
@@ -102,6 +104,8 @@ function triggerDailySummary(): void {
           channel: userId,
           text: chunks[i],
           thread_ts: threadTs,
+          unfurl_links: false,
+          unfurl_media: false,
         });
       }
     },
@@ -128,7 +132,7 @@ function scheduleDailySummary(): void {
   const ms = next.getTime() - now.getTime();
   console.log(
     `Daily summary scheduled at ${config.dailySummaryTime} ` +
-      `for channels: ${config.channels.dailySummary.join(", ")} ` +
+      `for channels: ${config.channels.dailySummary.map((c) => c.name).join(", ")} ` +
       `(in ${Math.round(ms / 60000)} min)`
   );
 
