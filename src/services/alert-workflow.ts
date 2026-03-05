@@ -24,11 +24,16 @@ function buildUsageFooter(result: CliRunResult): string {
 
 /** Extract the summary (header + section 1) from the full report markdown. */
 function extractSummary(text: string): { summary: string; fullReport: string } {
-  // Split at the first "---" separator to get just the header + one-liner summary
-  const firstSeparator = text.match(/\n---\n/);
-  if (firstSeparator?.index != null) {
-    return { summary: text.slice(0, firstSeparator.index).trimEnd(), fullReport: text };
+  // Split at the second "---" separator to include header + Recommended Action section
+  const separatorPattern = /\n---\n/g;
+  let match = separatorPattern.exec(text); // first ---
+  if (match) {
+    match = separatorPattern.exec(text);   // second ---
   }
+  if (match?.index != null) {
+    return { summary: text.slice(0, match.index).trimEnd(), fullReport: text };
+  }
+  // Fallback: if fewer than 2 separators, return everything
   return { summary: text, fullReport: text };
 }
 
