@@ -114,9 +114,6 @@ export const config = {
     : ["athena", "atlassian", "slack"],
   claudeConfigPath: process.env.CLAUDE_CONFIG_PATH || path.join(os.homedir(), ".claude.json"),
 
-  // Skills directory for skill detection and injection
-  skillsDir: process.env.SKILLS_DIR || "/Users/neocapitelo/go/src/github.com/one-claude/one/skills",
-
   // Gemini API
   geminiApiKey: process.env.GEMINI_API_KEY || "",
 

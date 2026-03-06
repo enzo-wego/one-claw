@@ -4,8 +4,9 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
 import { acknowledgePagerDutyIncident, getPagerDutyIncidentStatus } from "./pagerduty.js";
-import { spawnClaudeCli, safeKill, detectAndLoadSkill, chunkResponse, markdownToSlackMrkdwn, type CliRunResult } from "./claude-cli.js";
-import { insertWorkflow, deleteWorkflow, getWorkflowsByType } from "./database.js";
+import { spawnClaudeCli, safeKill, detectAndLoadSkill, chunkResponse, markdownToSlackMrkdwn, rewriteApiError, type CliRunResult } from "./claude-cli.js";
+import { insertWorkflow, deleteWorkflow, getWorkflowsByType, getAllWorkflows, updateWorkflowType, updateWorkflowCliSession } from "./database.js";
+import { createDiscussFromWorkflow } from "./discuss-workflow.js";
 
 function formatTokens(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
@@ -99,12 +100,12 @@ function buildSlackLink(channelId: string, messageTs: string): string {
   return `https://${config.slackWorkspaceDomain}/archives/${channelId}/p${tsNoDot}`;
 }
 
-/** Check if an incident is already being handled by an active workflow */
+/** Check if an incident is already being handled by an active workflow (any type, including converted discuss sessions) */
 function isIncidentAlreadyTracked(incidentId: string): boolean {
   for (const w of workflows.values()) {
     if (w.incidentId === incidentId) return true;
   }
-  const dbRows = getWorkflowsByType("alert");
+  const dbRows = getAllWorkflows();
   return dbRows.some(r => r.incident_id === incidentId);
 }
 
@@ -185,7 +186,7 @@ export async function startAlertWorkflow(
   }
 
   // 2. Load skill content and spawn Claude CLI to investigate
-  const skillContext = detectAndLoadSkill(config.alertSkill);
+  const skillContext = detectAndLoadSkill(config.alertSkill, config.paymentsRepoPath);
   if (!skillContext) {
     console.error(`[AlertWorkflow] Skill "${config.alertSkill}" not found, aborting workflow`);
     workflows.delete(messageTs);
@@ -219,12 +220,17 @@ export async function startAlertWorkflow(
     );
 
     // Prefer fullReport (detailed investigation) over short result summary
-    const rawText = result.fullReport || result.response
+    let rawText = result.fullReport || result.response
       || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI.");
+    const rewritten = rewriteApiError(rawText);
+    if (rewritten) {
+      console.warn(`[AlertWorkflow] API error in thread ${messageTs}, rewriting: ${rawText.slice(0, 200)}`);
+      rawText = rewritten;
+    }
 
     // Extract summary (header + section 1) for Slack, save full report to file
     const { summary } = extractSummary(rawText);
-    const reportPath = saveFullReport(messageTs, rawText);
+    const reportPath = rewritten ? undefined : saveFullReport(messageTs, rawText);
     const summaryText = markdownToSlackMrkdwn(summary) + buildUsageFooter(result);
 
     try {
@@ -305,7 +311,19 @@ export async function startAlertWorkflow(
       console.error(`[AlertWorkflow] Failed to post response:`, err);
     }
 
-    // Only start timer if workflow is still active
+    // Convert to discuss session if we got a sessionId (no API error)
+    if (result.sessionId && !rewritten && workflows.has(messageTs)) {
+      console.log(`[AlertWorkflow] Converting thread ${messageTs} to discuss session (session: ${result.sessionId})`);
+      const lastPostedTs = thinkingTs || null;
+      createDiscussFromWorkflow(channelId, messageTs, result.sessionId, lastPostedTs);
+      updateWorkflowType(messageTs, "discuss");
+      updateWorkflowCliSession(messageTs, result.sessionId);
+      clearFeedbackTimer(workflow);
+      workflows.delete(messageTs);
+      return;
+    }
+
+    // No sessionId or API error — keep as alert with feedback timer
     if (workflows.has(messageTs)) {
       startFeedbackTimer(app, workflow);
     }
@@ -333,7 +351,7 @@ export async function handleOwnerFeedback(
 
   // Load skill and spawn follow-up CLI
   const slackLink = buildSlackLink(workflow.channelId, threadTs);
-  const skillContext = detectAndLoadSkill(config.alertSkill);
+  const skillContext = detectAndLoadSkill(config.alertSkill, config.paymentsRepoPath);
   if (!skillContext) {
     console.error(`[AlertWorkflow] Skill "${config.alertSkill}" not found for follow-up`);
     return;
@@ -361,8 +379,13 @@ export async function handleOwnerFeedback(
       `[AlertWorkflow] Follow-up CLI finished for thread ${threadTs} (exit: ${result.exitCode})`
     );
 
-    const rawFollowUpText = result.fullReport || result.response
+    let rawFollowUpText = result.fullReport || result.response
       || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI.");
+    const rewrittenFollowUp = rewriteApiError(rawFollowUpText);
+    if (rewrittenFollowUp) {
+      console.warn(`[AlertWorkflow] API error in follow-up for thread ${threadTs}: ${rawFollowUpText.slice(0, 200)}`);
+      rawFollowUpText = rewrittenFollowUp;
+    }
     const responseText = markdownToSlackMrkdwn(rawFollowUpText) + buildUsageFooter(result);
 
     try {
@@ -421,6 +444,18 @@ export async function handleOwnerFeedback(
       console.log(`[AlertWorkflow] Posted follow-up response (${chunks.length} chunk(s), ${responseText.length} chars) to thread ${threadTs}`);
     } catch (err) {
       console.error(`[AlertWorkflow] Failed to post follow-up response:`, err);
+    }
+
+    // Convert to discuss session if we got a sessionId (no API error)
+    if (result.sessionId && !rewrittenFollowUp && workflows.has(threadTs)) {
+      console.log(`[AlertWorkflow] Converting follow-up thread ${threadTs} to discuss session (session: ${result.sessionId})`);
+      const lastPostedTs = thinkingTs || null;
+      createDiscussFromWorkflow(workflow.channelId, threadTs, result.sessionId, lastPostedTs);
+      updateWorkflowType(threadTs, "discuss");
+      updateWorkflowCliSession(threadTs, result.sessionId);
+      clearFeedbackTimer(workflow);
+      workflows.delete(threadTs);
+      return;
     }
 
     if (workflows.has(threadTs)) {

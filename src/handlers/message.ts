@@ -76,6 +76,24 @@ function formatGeminiResponse(result: { text: string; sources: { title: string; 
   return msg;
 }
 
+/** Natural language patterns that map to skills.
+ *  Each entry: [regex with capture group for args, skill name] */
+const NATURAL_LANGUAGE_SKILLS: [RegExp, string][] = [
+  [/^check\s+(?:on\s+)?prod(?:uction)?\s+(?:for\s+)?(.+)/i, "pay-ops-production"],
+];
+
+/** Try to match natural language patterns to a skill invocation */
+function detectNaturalLanguageSkill(text: string): { skillText: string; args: string } | null {
+  for (const [pattern, skillName] of NATURAL_LANGUAGE_SKILLS) {
+    const match = text.match(pattern);
+    if (match) {
+      const args = match[1].trim();
+      return { skillText: `one:${skillName} ${args}`, args };
+    }
+  }
+  return null;
+}
+
 function stripMention(text: string): string {
   return text.replace(/<@[A-Z0-9]+>/g, "").trim();
 }
@@ -109,27 +127,39 @@ async function fetchThreadContext(
     const isNewSession = !lastSeenTs;
     const BOT_MSG_LIMIT = 500;
 
-    const messages = (res.messages || [])
-      .filter((m) => {
-        // For follow-ups in active sessions: only non-bot messages since lastSeenTs
-        if (!isNewSession) {
-          if (m.bot_id || m.user === botUserId) return false;
-          if (m.ts && m.ts <= lastSeenTs!) return false;
-          return true;
-        }
-        // For new sessions: include everything (root, bots, users)
+    const filtered = (res.messages || []).filter((m) => {
+      // For follow-ups in active sessions: only non-bot messages since lastSeenTs
+      if (!isNewSession) {
+        if (m.bot_id || m.user === botUserId) return false;
+        if (m.ts && m.ts <= lastSeenTs!) return false;
         return true;
-      })
-      .map((m) => {
-        const isBot = !!(m.bot_id || m.user === botUserId);
-        const text = m.text || "";
-        // Truncate long bot messages to keep prompt reasonable
-        const displayText = isBot && text.length > BOT_MSG_LIMIT
-          ? text.slice(0, BOT_MSG_LIMIT) + "... [truncated]"
-          : text;
-        const prefix = isBot ? "[bot]" : `<@${m.user}>`;
-        return `${prefix}: ${displayText}`.trim();
-      });
+      }
+      // For new sessions: include everything (root, bots, users)
+      return true;
+    });
+
+    const messages: string[] = [];
+    for (const m of filtered) {
+      const isBot = !!(m.bot_id || m.user === botUserId);
+      const text = m.text || "";
+      // Truncate long bot messages to keep prompt reasonable
+      const displayText = isBot && text.length > BOT_MSG_LIMIT
+        ? text.slice(0, BOT_MSG_LIMIT) + "... [truncated]"
+        : text;
+      const prefix = isBot ? "[bot]" : `<@${m.user}>`;
+      let line = `${prefix}: ${displayText}`.trim();
+
+      // Include file attachments from thread messages
+      const files = (m as any).files as SlackFile[] | undefined;
+      if (files && files.length > 0) {
+        const paths = await downloadSlackFiles(files, config.slackBotToken);
+        if (paths.length > 0) {
+          line += "\n" + paths.map((p) => `  [attached file: ${p}]`).join("\n");
+        }
+      }
+
+      messages.push(line);
+    }
 
     if (messages.length === 0) return "";
     const label = isNewSession
@@ -168,7 +198,7 @@ async function handleDm(
 
   try {
     const prompt = filePrefix + cleanText;
-    const skillContext = detectAndLoadSkill(cleanText) ?? undefined;
+    const skillContext = detectAndLoadSkill(cleanText, config.paymentsRepoPath) ?? undefined;
     const { done } = spawnDiscussCli(prompt, config.paymentsRepoPath, {
       model: config.discussModel,
       skillContext,
@@ -215,7 +245,8 @@ export function registerHandlers(
 
     // Ignore bot messages and other subtypes (joins, etc.)
     if (msg.bot_id || msg.user === botUserId) return;
-    if (raw.subtype && !isEdit) return;
+    const isFileShare = raw.subtype === "file_share";
+    if (raw.subtype && !isEdit && !isFileShare) return;
 
     // Skip edits for messages that already have an active discuss session
     if (isEdit) {
@@ -339,7 +370,7 @@ export function registerHandlers(
         // No active session → start a new one with Gemini context
         const context = await fetchThreadContext(app, msg.channel, threadTs, null, botUserId);
         const prompt = filePrefix + context + geminiContext + (resumeText || "Continue our task based on the Gemini analysis above.");
-        const skill = detectAndLoadSkill(resumeText || "") ?? undefined;
+        const skill = detectAndLoadSkill(resumeText || "", config.paymentsRepoPath) ?? undefined;
         await startDiscussSession(app, msg.channel, threadTs, prompt, skill);
       }
       return;
@@ -368,24 +399,31 @@ export function registerHandlers(
 
     const filePrefix = await extractFilePrefix(msg.files as SlackFile[] | undefined);
 
+    // Check for natural language skill aliases (e.g. "check on production for ...")
+    const nlSkill = detectNaturalLanguageSkill(cleanText);
+    const effectiveText = nlSkill ? nlSkill.skillText : cleanText;
+
     // Active discussion → follow-up with thread context
     if (activeDiscussion) {
-      const context = await fetchThreadContext(
-        app,
-        msg.channel,
-        threadTs,
-        activeDiscussion.lastSeenTs,
-        botUserId
-      );
-      const prompt = filePrefix + context + cleanText;
+      let context = "";
+      if (!activeDiscussion.cliSessionId) {
+        // Session was reset (API error) — fetch full thread for context since CLI has no memory
+        context = await fetchThreadContext(app, msg.channel, threadTs, null, botUserId);
+      } else if (activeDiscussion.lastSeenTs) {
+        // Normal follow-up with active session — fetch only OTHER users' messages since last response
+        context = await fetchThreadContext(app, msg.channel, threadTs, activeDiscussion.lastSeenTs, botUserId);
+      }
+      // If cliSessionId exists but lastSeenTs is null (post-restart), skip context entirely —
+      // --resume already has full conversation history
+      const prompt = filePrefix + context + effectiveText;
       await handleDiscussReply(app, threadTs, prompt);
       return;
     }
 
     // No active session → start new discuss session with thread context
     const context = await fetchThreadContext(app, msg.channel, threadTs, null, botUserId);
-    const prompt = filePrefix + context + cleanText;
-    const skill = detectAndLoadSkill(cleanText) ?? undefined;
+    const prompt = filePrefix + context + effectiveText;
+    const skill = detectAndLoadSkill(effectiveText, config.paymentsRepoPath) ?? undefined;
     await startDiscussSession(app, msg.channel, threadTs, prompt, skill);
   });
 }

@@ -39,6 +39,7 @@ export interface ActiveWorkflowRow {
   incident_id: string | null;
   dag_name: string | null;
   cli_session_id: string | null;
+  last_seen_ts: string | null;
   created_at: string;
 }
 
@@ -98,6 +99,13 @@ export function initDatabase(dbPath: string): Database.Database {
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
+
+  // Migrations: add columns that may not exist yet
+  const cols = db.prepare("PRAGMA table_info(active_workflows)").all() as { name: string }[];
+  const colNames = new Set(cols.map((c) => c.name));
+  if (!colNames.has("last_seen_ts")) {
+    db.exec("ALTER TABLE active_workflows ADD COLUMN last_seen_ts TEXT");
+  }
 
   return db;
 }
@@ -226,10 +234,31 @@ export function insertWorkflow(
     );
 }
 
+export function updateWorkflowType(
+  threadTs: string,
+  workflowType: ActiveWorkflowRow["workflow_type"]
+): void {
+  getDb()
+    .prepare("UPDATE active_workflows SET workflow_type = ? WHERE thread_ts = ?")
+    .run(workflowType, threadTs);
+}
+
+export function getAllWorkflows(): ActiveWorkflowRow[] {
+  return getDb()
+    .prepare("SELECT * FROM active_workflows")
+    .all() as ActiveWorkflowRow[];
+}
+
 export function updateWorkflowCliSession(threadTs: string, cliSessionId: string): void {
   getDb()
     .prepare("UPDATE active_workflows SET cli_session_id = ? WHERE thread_ts = ?")
     .run(cliSessionId, threadTs);
+}
+
+export function updateWorkflowLastSeenTs(threadTs: string, lastSeenTs: string): void {
+  getDb()
+    .prepare("UPDATE active_workflows SET last_seen_ts = ? WHERE thread_ts = ?")
+    .run(lastSeenTs, threadTs);
 }
 
 export function deleteWorkflow(threadTs: string): void {

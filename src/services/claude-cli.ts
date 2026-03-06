@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync, globSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { config } from "../config.js";
 import { getMcpConfigPath } from "./mcp-config.js";
@@ -12,6 +13,7 @@ export interface CliRunResult {
   fullReport?: string;
   inputTokens?: number;
   outputTokens?: number;
+  sessionId?: string;
 }
 
 export interface DiscussCliResult {
@@ -35,7 +37,28 @@ export interface SpawnResult {
   done: Promise<CliRunResult>;
 }
 
-const SLACK_MAX_LENGTH = 3900;
+const SLACK_MAX_LENGTH = 3500;
+
+/** Detect known API error patterns in CLI responses and rewrite them as friendly messages.
+ *  Only matches when the response starts with the error pattern (not buried in normal text). */
+export function rewriteApiError(response: string): string | null {
+  // Only match if the response itself IS an API error (anchored to start, optional whitespace)
+  const match = response.match(/^\s*API Error:\s*(\d+)\s*([\s\S]*)/);
+  if (!match) return null;
+
+  const statusCode = match[1];
+  const body = match[2];
+
+  if (body.includes("Could not process image")) {
+    return (
+      "The session context contained stale image data that the API could not process. " +
+      "Session has been reset — please send your message again."
+    );
+  }
+
+  // Generic API error fallback
+  return `Something went wrong (API error ${statusCode}). Session has been reset — please try again.`;
+}
 
 /** Split a long response into Slack-safe chunks, breaking at paragraph/line boundaries */
 export function chunkResponse(text: string, maxLength = SLACK_MAX_LENGTH): string[] {
@@ -144,29 +167,51 @@ export interface SkillContext {
 }
 
 /**
- * Detect skill patterns like "one:pay-ops-build staging" or "/pay-ops-build staging"
+ * Search project-level then user-level plugin cache for a skill's SKILL.md.
+ * Returns { skillDir, skillPath } or null if not found.
+ */
+function resolveSkillPath(skillName: string, cwd: string): { skillDir: string; skillPath: string } | null {
+  // 1. Project-level: <cwd>/.claude/skills/<skillName>/SKILL.md
+  const projectSkillDir = path.join(cwd, ".claude", "skills", skillName);
+  const projectSkillPath = path.join(projectSkillDir, "SKILL.md");
+  if (existsSync(projectSkillPath)) {
+    return { skillDir: projectSkillDir, skillPath: projectSkillPath };
+  }
+
+  // 2. User-level plugin cache: ~/.claude/plugins/cache/*/*/*/skills/<skillName>/SKILL.md
+  const cachePattern = path.join(os.homedir(), ".claude", "plugins", "cache", "*", "*", "*", "skills", skillName, "SKILL.md");
+  const matches = globSync(cachePattern);
+  if (matches.length > 0) {
+    const skillPath = matches[0];
+    const skillDir = path.dirname(skillPath);
+    return { skillDir, skillPath };
+  }
+
+  return null;
+}
+
+/**
+ * Detect skill patterns like "one:pay-ops-build staging" or "skill pay-ops-build staging"
  * in user text, load the SKILL.md, and return context for injection.
  */
-export function detectAndLoadSkill(text: string): SkillContext | null {
-  // Match "one:<skill-name>" or "/<skill-name>" patterns
-  const match = text.match(/(?:one:|(\/))([a-z][a-z0-9-]*)/i);
+export function detectAndLoadSkill(text: string, cwd: string): SkillContext | null {
+  // Match "one:<skill-name>" or "skill <skill-name>" patterns
+  const match = text.match(/(?:one:|skill\s+)([a-z][a-z0-9-]*)/i);
   if (!match) return null;
 
-  const skillName = match[2];
-  const skillDir = path.join(config.skillsDir, skillName);
-  const skillPath = path.join(skillDir, "SKILL.md");
-
-  try {
-    const skillContent = readFileSync(skillPath, "utf-8");
-    // Extract args: everything after the matched skill pattern
-    const fullMatch = match[0];
-    const afterSkill = text.slice(text.indexOf(fullMatch) + fullMatch.length).trim();
-    console.log(`[ClaudeCLI] Detected skill "${skillName}" (args: "${afterSkill || "(none)"}")`);
-    return { skillName, skillContent, skillArgs: afterSkill };
-  } catch {
-    console.log(`[ClaudeCLI] Skill pattern "${skillName}" found but no SKILL.md at ${skillPath}`);
+  const skillName = match[1];
+  const resolved = resolveSkillPath(skillName, cwd);
+  if (!resolved) {
+    console.log(`[ClaudeCLI] Skill pattern "${skillName}" found but no SKILL.md in project or plugin cache`);
     return null;
   }
+
+  const skillContent = readFileSync(resolved.skillPath, "utf-8");
+  // Extract args: everything after the matched skill pattern
+  const fullMatch = match[0];
+  const afterSkill = text.slice(text.indexOf(fullMatch) + fullMatch.length).trim();
+  console.log(`[ClaudeCLI] Detected skill "${skillName}" from ${resolved.skillPath} (args: "${afterSkill || "(none)"}")`);
+  return { skillName, skillContent, skillArgs: afterSkill };
 }
 
 const PROMPT_LOG_LIMIT = 500;
@@ -182,9 +227,9 @@ const SKILL_SYSTEM_PROMPT =
   "6. Do NOT post or write messages to Slack. Your job is to investigate and return the report as your final text response. The bot will handle posting the report to the correct Slack thread. You MAY use Slack MCP tools to READ messages and threads for investigation.";
 
 /** Build the effective prompt with full SKILL.md content injected */
-function buildSkillPrompt(skillContext: SkillContext, fallbackPrompt: string): string {
+function buildSkillPrompt(skillContext: SkillContext, fallbackPrompt: string, cwd: string): string {
   const { skillName, skillContent, skillArgs } = skillContext;
-  const subSkillRefs = loadSubSkillReferences(skillContent);
+  const subSkillRefs = loadSubSkillReferences(skillContent, cwd);
   return (
     `Execute skill "${skillName}" with arguments "${skillArgs}".\n\n` +
     `<skill>\n${skillContent}\n</skill>${subSkillRefs}\n\n` +
@@ -195,7 +240,7 @@ function buildSkillPrompt(skillContext: SkillContext, fallbackPrompt: string): s
   );
 }
 
-function loadSubSkillReferences(skillContent: string): string {
+function loadSubSkillReferences(skillContent: string, cwd: string): string {
   // Find all Skill(one:xxx, ...) references in skill content
   const skillRefs = new Set<string>();
   const pattern = /Skill\(one:([a-z][a-z0-9-]*)/gi;
@@ -208,13 +253,13 @@ function loadSubSkillReferences(skillContent: string): string {
 
   const refs: string[] = [];
   for (const name of skillRefs) {
-    const refPath = path.join(config.skillsDir, name, "SKILL.md");
-    try {
-      const content = readFileSync(refPath, "utf-8");
+    const resolved = resolveSkillPath(name, cwd);
+    if (resolved) {
+      const content = readFileSync(resolved.skillPath, "utf-8");
       refs.push(`<skill-reference name="${name}">\n${content}\n</skill-reference>`);
-      console.log(`[ClaudeCLI] Loaded sub-skill reference: ${name}`);
-    } catch {
-      console.log(`[ClaudeCLI] Sub-skill "${name}" not found at ${refPath}, skipping`);
+      console.log(`[ClaudeCLI] Loaded sub-skill reference: ${name} from ${resolved.skillPath}`);
+    } else {
+      console.log(`[ClaudeCLI] Sub-skill "${name}" not found in project or plugin cache, skipping`);
     }
   }
 
@@ -234,7 +279,7 @@ export function spawnClaudeCli(
 ): SpawnResult {
   // If skill context is provided, inject full SKILL.md content into the prompt
   const effectivePrompt = options?.skillContext
-    ? buildSkillPrompt(options.skillContext, prompt)
+    ? buildSkillPrompt(options.skillContext, prompt, cwd)
     : prompt;
 
   const args = ["-p", effectivePrompt, "--verbose", "--model", config.alertModel, "--dangerously-skip-permissions", "--output-format", "stream-json"];
@@ -281,6 +326,7 @@ export function spawnClaudeCli(
     let response: string | undefined;
     let inputTokens: number | undefined;
     let outputTokens: number | undefined;
+    let sessionId: string | undefined;
     let assistantText = "";
     let longestAssistantText = "";
     let stdout = "";
@@ -318,6 +364,7 @@ export function spawnClaudeCli(
           }
           if (obj.type === "result") {
             if (typeof obj.total_cost_usd === "number") costUsd = obj.total_cost_usd;
+            if (typeof obj.session_id === "string") sessionId = obj.session_id;
             if (typeof obj.result === "string" && obj.result) {
               response = obj.result;
             } else if (Array.isArray(obj.result)) {
@@ -345,7 +392,7 @@ export function spawnClaudeCli(
     child.on("error", (err) => {
       console.error(`[ClaudeCLI] spawn error:`, err.message);
       const fullReport = longestAssistantText || undefined;
-      resolve({ exitCode: null, costUsd, response, fullReport, inputTokens, outputTokens });
+      resolve({ exitCode: null, costUsd, response, fullReport, inputTokens, outputTokens, sessionId });
     });
 
     child.on("close", (code) => {
@@ -360,7 +407,7 @@ export function spawnClaudeCli(
       if (costUsd !== undefined) {
         console.log(`[ClaudeCLI] Done. Cost: $${costUsd.toFixed(4)}`);
       }
-      resolve({ exitCode: code, costUsd, response, fullReport, inputTokens, outputTokens });
+      resolve({ exitCode: code, costUsd, response, fullReport, inputTokens, outputTokens, sessionId });
     });
   });
 
@@ -374,7 +421,7 @@ export function spawnDiscussCli(
 ): { child: ChildProcess; done: Promise<DiscussCliResult> } {
   // If skill context is provided, inject full SKILL.md content into the prompt
   const effectivePrompt = options?.skillContext
-    ? buildSkillPrompt(options.skillContext, prompt)
+    ? buildSkillPrompt(options.skillContext, prompt, cwd)
     : prompt;
 
   const args: string[] = [];

@@ -1,8 +1,9 @@
 import type { App } from "@slack/bolt";
 import type { ChildProcess } from "node:child_process";
 import { config } from "../config.js";
-import { spawnClaudeCli, safeKill, detectAndLoadSkill, chunkResponse, markdownToSlackMrkdwn, type CliRunResult } from "./claude-cli.js";
-import { insertWorkflow, deleteWorkflow, getWorkflowsByType } from "./database.js";
+import { spawnClaudeCli, safeKill, detectAndLoadSkill, chunkResponse, markdownToSlackMrkdwn, rewriteApiError, type CliRunResult } from "./claude-cli.js";
+import { insertWorkflow, deleteWorkflow, getWorkflowsByType, updateWorkflowType, updateWorkflowCliSession } from "./database.js";
+import { createDiscussFromWorkflow } from "./discuss-workflow.js";
 
 function formatTokens(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
@@ -79,7 +80,7 @@ export async function startDelayAlertWorkflow(
   );
 
   // Load skill content and spawn Claude CLI to investigate
-  const skillContext = detectAndLoadSkill(config.delayAlertSkill);
+  const skillContext = detectAndLoadSkill(config.delayAlertSkill, config.paymentsRepoPath);
   if (!skillContext) {
     console.error(`[DelayAlertWorkflow] Skill "${config.delayAlertSkill}" not found, aborting workflow`);
     workflows.delete(messageTs);
@@ -112,38 +113,94 @@ export async function startDelayAlertWorkflow(
       `[DelayAlertWorkflow] CLI finished for Dag: ${dagName}, thread ${messageTs} (exit: ${result.exitCode})`
     );
 
-    const rawText = result.fullReport || result.response
+    let rawText = result.fullReport || result.response
       || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI.");
+    const rewritten = rewriteApiError(rawText);
+    if (rewritten) {
+      console.warn(`[DelayAlertWorkflow] API error in thread ${messageTs}: ${rawText.slice(0, 200)}`);
+      rawText = rewritten;
+    }
     const responseText = markdownToSlackMrkdwn(rawText) + buildUsageFooter(result);
 
     try {
       const chunks = chunkResponse(responseText);
 
       if (thinkingTs) {
-        await app.client.chat.update({
-          channel: channelId,
-          ts: thinkingTs,
-          text: chunks[0],
-        });
+        try {
+          await app.client.chat.update({
+            channel: channelId,
+            ts: thinkingTs,
+            text: chunks[0],
+          });
+        } catch (updateErr: any) {
+          if (updateErr?.data?.error === "msg_too_long") {
+            console.warn(`[DelayAlertWorkflow] msg_too_long on update, truncating (${chunks[0].length} chars)`);
+            await app.client.chat.update({
+              channel: channelId,
+              ts: thinkingTs,
+              text: chunks[0].slice(0, 3800) + "\n\n_(truncated)_",
+            });
+          } else {
+            throw updateErr;
+          }
+        }
       } else {
-        await app.client.chat.postMessage({
-          channel: channelId,
-          thread_ts: messageTs,
-          text: chunks[0],
-        });
+        try {
+          await app.client.chat.postMessage({
+            channel: channelId,
+            thread_ts: messageTs,
+            text: chunks[0],
+          });
+        } catch (postErr: any) {
+          if (postErr?.data?.error === "msg_too_long") {
+            console.warn(`[DelayAlertWorkflow] msg_too_long on post, truncating (${chunks[0].length} chars)`);
+            await app.client.chat.postMessage({
+              channel: channelId,
+              thread_ts: messageTs,
+              text: chunks[0].slice(0, 3800) + "\n\n_(truncated)_",
+            });
+          } else {
+            throw postErr;
+          }
+        }
       }
 
       for (let i = 1; i < chunks.length; i++) {
-        await app.client.chat.postMessage({
-          channel: channelId,
-          thread_ts: messageTs,
-          text: chunks[i],
-        });
+        try {
+          await app.client.chat.postMessage({
+            channel: channelId,
+            thread_ts: messageTs,
+            text: chunks[i],
+          });
+        } catch (postErr: any) {
+          if (postErr?.data?.error === "msg_too_long") {
+            console.warn(`[DelayAlertWorkflow] msg_too_long on chunk ${i}, truncating (${chunks[i].length} chars)`);
+            await app.client.chat.postMessage({
+              channel: channelId,
+              thread_ts: messageTs,
+              text: chunks[i].slice(0, 3800) + "\n\n_(truncated)_",
+            });
+          } else {
+            throw postErr;
+          }
+        }
       }
 
       console.log(`[DelayAlertWorkflow] Posted response (${chunks.length} chunk(s)) to thread ${messageTs}`);
     } catch (err) {
       console.error(`[DelayAlertWorkflow] Failed to post response:`, err);
+    }
+
+    // Convert to discuss session if we got a sessionId (no API error)
+    if (result.sessionId && !rewritten && workflows.has(messageTs)) {
+      console.log(`[DelayAlertWorkflow] Converting thread ${messageTs} to discuss session (session: ${result.sessionId})`);
+      const lastPostedTs = thinkingTs || null;
+      createDiscussFromWorkflow(channelId, messageTs, result.sessionId, lastPostedTs);
+      updateWorkflowType(messageTs, "discuss");
+      updateWorkflowCliSession(messageTs, result.sessionId);
+      clearFeedbackTimer(workflow);
+      workflows.delete(messageTs);
+      return;
     }
 
     if (workflows.has(messageTs)) {
@@ -172,7 +229,7 @@ export async function handleDelayOwnerFeedback(
 
   // Load skill and spawn follow-up CLI
   const slackLink = buildSlackLink(workflow.channelId, threadTs);
-  const skillContext = detectAndLoadSkill(config.delayAlertSkill);
+  const skillContext = detectAndLoadSkill(config.delayAlertSkill, config.paymentsRepoPath);
   if (!skillContext) {
     console.error(`[DelayAlertWorkflow] Skill "${config.delayAlertSkill}" not found for follow-up`);
     return;
@@ -200,38 +257,94 @@ export async function handleDelayOwnerFeedback(
       `[DelayAlertWorkflow] Follow-up CLI finished for thread ${threadTs} (exit: ${result.exitCode})`
     );
 
-    const rawFollowUpText = result.fullReport || result.response
+    let rawFollowUpText = result.fullReport || result.response
       || (result.exitCode !== 0 ? `CLI exited with error (code: ${result.exitCode}).` : "No response from CLI.");
+    const rewrittenFollowUp = rewriteApiError(rawFollowUpText);
+    if (rewrittenFollowUp) {
+      console.warn(`[DelayAlertWorkflow] API error in follow-up for thread ${threadTs}: ${rawFollowUpText.slice(0, 200)}`);
+      rawFollowUpText = rewrittenFollowUp;
+    }
     const responseText = markdownToSlackMrkdwn(rawFollowUpText) + buildUsageFooter(result);
 
     try {
       const chunks = chunkResponse(responseText);
 
       if (thinkingTs) {
-        await app.client.chat.update({
-          channel: workflow.channelId,
-          ts: thinkingTs,
-          text: chunks[0],
-        });
+        try {
+          await app.client.chat.update({
+            channel: workflow.channelId,
+            ts: thinkingTs,
+            text: chunks[0],
+          });
+        } catch (updateErr: any) {
+          if (updateErr?.data?.error === "msg_too_long") {
+            console.warn(`[DelayAlertWorkflow] msg_too_long on follow-up update, truncating (${chunks[0].length} chars)`);
+            await app.client.chat.update({
+              channel: workflow.channelId,
+              ts: thinkingTs,
+              text: chunks[0].slice(0, 3800) + "\n\n_(truncated)_",
+            });
+          } else {
+            throw updateErr;
+          }
+        }
       } else {
-        await app.client.chat.postMessage({
-          channel: workflow.channelId,
-          thread_ts: threadTs,
-          text: chunks[0],
-        });
+        try {
+          await app.client.chat.postMessage({
+            channel: workflow.channelId,
+            thread_ts: threadTs,
+            text: chunks[0],
+          });
+        } catch (postErr: any) {
+          if (postErr?.data?.error === "msg_too_long") {
+            console.warn(`[DelayAlertWorkflow] msg_too_long on follow-up post, truncating (${chunks[0].length} chars)`);
+            await app.client.chat.postMessage({
+              channel: workflow.channelId,
+              thread_ts: threadTs,
+              text: chunks[0].slice(0, 3800) + "\n\n_(truncated)_",
+            });
+          } else {
+            throw postErr;
+          }
+        }
       }
 
       for (let i = 1; i < chunks.length; i++) {
-        await app.client.chat.postMessage({
-          channel: workflow.channelId,
-          thread_ts: threadTs,
-          text: chunks[i],
-        });
+        try {
+          await app.client.chat.postMessage({
+            channel: workflow.channelId,
+            thread_ts: threadTs,
+            text: chunks[i],
+          });
+        } catch (postErr: any) {
+          if (postErr?.data?.error === "msg_too_long") {
+            console.warn(`[DelayAlertWorkflow] msg_too_long on follow-up chunk ${i}, truncating (${chunks[i].length} chars)`);
+            await app.client.chat.postMessage({
+              channel: workflow.channelId,
+              thread_ts: threadTs,
+              text: chunks[i].slice(0, 3800) + "\n\n_(truncated)_",
+            });
+          } else {
+            throw postErr;
+          }
+        }
       }
 
       console.log(`[DelayAlertWorkflow] Posted follow-up response (${chunks.length} chunk(s)) to thread ${threadTs}`);
     } catch (err) {
       console.error(`[DelayAlertWorkflow] Failed to post follow-up response:`, err);
+    }
+
+    // Convert to discuss session if we got a sessionId (no API error)
+    if (result.sessionId && !rewrittenFollowUp && workflows.has(threadTs)) {
+      console.log(`[DelayAlertWorkflow] Converting follow-up thread ${threadTs} to discuss session (session: ${result.sessionId})`);
+      const lastPostedTs = thinkingTs || null;
+      createDiscussFromWorkflow(workflow.channelId, threadTs, result.sessionId, lastPostedTs);
+      updateWorkflowType(threadTs, "discuss");
+      updateWorkflowCliSession(threadTs, result.sessionId);
+      clearFeedbackTimer(workflow);
+      workflows.delete(threadTs);
+      return;
     }
 
     if (workflows.has(threadTs)) {

@@ -4,6 +4,7 @@ import path from "node:path";
 
 const SLACK_FILES_DIR = "./data/slack-files";
 const FILE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const MAX_FILE_SIZE_MB = 10;
 
 const SUPPORTED_PREFIXES = ["image/", "application/pdf", "text/"];
 
@@ -62,6 +63,11 @@ export async function downloadSlackFiles(
       }
 
       const buffer = Buffer.from(await res.arrayBuffer());
+      const sizeMb = buffer.length / (1024 * 1024);
+      if (sizeMb > MAX_FILE_SIZE_MB) {
+        console.warn(`[SlackFiles] Skipping ${file.id}: ${sizeMb.toFixed(1)}MB exceeds ${MAX_FILE_SIZE_MB}MB limit`);
+        continue;
+      }
       await writeFile(localPath, buffer);
       downloadedPaths.push(path.resolve(localPath));
       console.log(`[SlackFiles] Downloaded ${file.id} → ${localPath}`);
