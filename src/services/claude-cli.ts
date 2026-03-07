@@ -164,6 +164,7 @@ export interface SkillContext {
   skillName: string;
   skillContent: string;
   skillArgs: string;
+  skillDir: string;
 }
 
 /**
@@ -211,7 +212,7 @@ export function detectAndLoadSkill(text: string, cwd: string): SkillContext | nu
   const fullMatch = match[0];
   const afterSkill = text.slice(text.indexOf(fullMatch) + fullMatch.length).trim();
   console.log(`[ClaudeCLI] Detected skill "${skillName}" from ${resolved.skillPath} (args: "${afterSkill || "(none)"}")`);
-  return { skillName, skillContent, skillArgs: afterSkill };
+  return { skillName, skillContent, skillArgs: afterSkill, skillDir: resolved.skillDir };
 }
 
 const PROMPT_LOG_LIMIT = 500;
@@ -228,11 +229,26 @@ const SKILL_SYSTEM_PROMPT =
 
 /** Build the effective prompt with full SKILL.md content injected */
 function buildSkillPrompt(skillContext: SkillContext, fallbackPrompt: string, cwd: string): string {
-  const { skillName, skillContent, skillArgs } = skillContext;
-  const subSkillRefs = loadSubSkillReferences(skillContent, cwd);
+  const { skillName, skillContent, skillArgs, skillDir } = skillContext;
+
+  // Recursively load all referenced files and sub-skills
+  const ctx: LoadCtx = {
+    visitedFiles: new Set(),
+    visitedSkills: new Set([skillName]), // mark primary skill as visited
+    totalSize: Buffer.byteLength(skillContent, "utf-8"),
+  };
+  const { refs, subSkills } = loadReferencesRecursive(skillContent, skillDir, cwd, ctx);
+  const loaded: LoadedReferences = { primaryRefs: refs, subSkills, totalSize: ctx.totalSize };
+  const refsOutput = formatReferences(loaded);
+
+  const refCount = loaded.primaryRefs.length;
+  const subCount = loaded.subSkills.length;
+  const sizeKB = (loaded.totalSize / 1024).toFixed(1);
+  console.log(`[ClaudeCLI] Skill "${skillName}" loaded ${refCount} reference files, ${subCount} sub-skills (total: ${sizeKB}KB)`);
+
   return (
     `Execute skill "${skillName}" with arguments "${skillArgs}".\n\n` +
-    `<skill>\n${skillContent}\n</skill>${subSkillRefs}\n\n` +
+    `<skill>\n${skillContent}\n</skill>${refsOutput}\n\n` +
     `IMPORTANT: Follow every step in the skill workflow exactly in order. ` +
     `Do NOT skip any step. Many steps have infrastructure prerequisites ` +
     `(SSO login, VPN tunnels via sshuttle, browser authorization) that MUST ` +
@@ -240,36 +256,212 @@ function buildSkillPrompt(skillContext: SkillContext, fallbackPrompt: string, cw
   );
 }
 
-function loadSubSkillReferences(skillContent: string, cwd: string): string {
-  // Find all Skill(one:xxx, ...) references in skill content
-  const skillRefs = new Set<string>();
-  const pattern = /Skill\(one:([a-z][a-z0-9-]*)/gi;
-  let match;
-  while ((match = pattern.exec(skillContent)) !== null) {
-    skillRefs.add(match[1]);
+
+// ── Recursive skill reference loading ──────────────────────────────────────
+
+const MAX_SKILL_REFERENCES_SIZE = 512 * 1024; // 512KB
+
+/** File extensions we load from skill references */
+const REF_EXT = "md|sql|txt|yaml|yml|json";
+
+/**
+ * Extract relative file paths referenced in skill content via 4 patterns:
+ *  - `Load: path`
+ *  - `` Read `path` ``
+ *  - `[text](path)` (non-http markdown links)
+ *  - `` `references/...|workflows/...` `` backtick paths
+ */
+export function extractFileReferences(content: string): string[] {
+  const seen = new Set<string>();
+  const exts = REF_EXT;
+
+  // 1. Load: directive
+  for (const m of content.matchAll(
+    new RegExp(`^\\s*Load:\\s*(\\S+\\.(?:${exts}))`, "gm")
+  )) {
+    seen.add(m[1]);
   }
 
-  if (skillRefs.size === 0) return "";
+  // 2. Read `path`
+  for (const m of content.matchAll(
+    new RegExp(`Read\\s+\`([^\`]+\\.(?:${exts}))\``, "g")
+  )) {
+    seen.add(m[1]);
+  }
 
-  const refs: string[] = [];
-  for (const name of skillRefs) {
-    const resolved = resolveSkillPath(name, cwd);
-    if (resolved) {
-      const content = readFileSync(resolved.skillPath, "utf-8");
-      refs.push(`<skill-reference name="${name}">\n${content}\n</skill-reference>`);
-      console.log(`[ClaudeCLI] Loaded sub-skill reference: ${name} from ${resolved.skillPath}`);
-    } else {
-      console.log(`[ClaudeCLI] Sub-skill "${name}" not found in project or plugin cache, skipping`);
+  // 3. Markdown link (exclude http(s) URLs)
+  for (const m of content.matchAll(
+    new RegExp(`\\[[^\\]]+\\]\\((?!https?:\\/\\/)([^)]+\\.(?:${exts}))\\)`, "g")
+  )) {
+    seen.add(m[1]);
+  }
+
+  // 4. Backtick paths starting with references/ or workflows/
+  for (const m of content.matchAll(
+    new RegExp(`\`((?:references|workflows)\\/[^\`]+\\.(?:${exts}))\``, "g")
+  )) {
+    seen.add(m[1]);
+  }
+
+  return [...seen];
+}
+
+interface LoadedReference {
+  /** Display path (relative to skill dir) */
+  displayPath: string;
+  content: string;
+}
+
+interface LoadedSubSkill {
+  name: string;
+  skillContent: string;
+  references: LoadedReference[];
+}
+
+interface LoadedReferences {
+  primaryRefs: LoadedReference[];
+  subSkills: LoadedSubSkill[];
+  totalSize: number;
+}
+
+interface LoadCtx {
+  visitedFiles: Set<string>;
+  visitedSkills: Set<string>;
+  totalSize: number;
+}
+
+/**
+ * Recursively load file references from skill content and cross-referenced sub-skills.
+ * Prevents cycles (visitedFiles / visitedSkills) and enforces a size cap.
+ */
+function loadReferencesRecursive(
+  content: string,
+  skillDir: string,
+  cwd: string,
+  ctx: LoadCtx,
+): { refs: LoadedReference[]; subSkills: LoadedSubSkill[] } {
+  const refs: LoadedReference[] = [];
+  const subSkills: LoadedSubSkill[] = [];
+
+  // ── Load file references ────────────────────────────────────────────────
+  const filePaths = extractFileReferences(content);
+  for (const relPath of filePaths) {
+    if (ctx.totalSize >= MAX_SKILL_REFERENCES_SIZE) break;
+
+    const absPath = path.resolve(skillDir, relPath);
+
+    // Security: reject paths that escape the skill directory
+    if (!absPath.startsWith(skillDir + path.sep) && absPath !== skillDir) continue;
+    if (ctx.visitedFiles.has(absPath)) continue;
+    ctx.visitedFiles.add(absPath);
+
+    if (!existsSync(absPath)) {
+      console.log(`[ClaudeCLI] Skill reference not found, skipping: ${relPath}`);
+      continue;
+    }
+
+    try {
+      const fileContent = readFileSync(absPath, "utf-8");
+      const size = Buffer.byteLength(fileContent, "utf-8");
+      if (ctx.totalSize + size > MAX_SKILL_REFERENCES_SIZE) {
+        console.log(`[ClaudeCLI] Skill references size cap reached (${ctx.totalSize} + ${size} > ${MAX_SKILL_REFERENCES_SIZE}), skipping: ${relPath}`);
+        break;
+      }
+      ctx.totalSize += size;
+      refs.push({ displayPath: relPath, content: fileContent });
+
+      // Recurse into loaded file for further references
+      const nested = loadReferencesRecursive(fileContent, skillDir, cwd, ctx);
+      refs.push(...nested.refs);
+      subSkills.push(...nested.subSkills);
+    } catch (err) {
+      console.log(`[ClaudeCLI] Failed to read skill reference ${relPath}: ${(err as Error).message}`);
     }
   }
 
-  return refs.length > 0
-    ? "\n\n<sub-skill-references>\n" +
+  // ── Load cross-skill references (Skill(one:xxx)) ───────────────────────
+  const skillPattern = /Skill\(one:([a-z][a-z0-9-]*)/gi;
+  let skillMatch;
+  while ((skillMatch = skillPattern.exec(content)) !== null) {
+    if (ctx.totalSize >= MAX_SKILL_REFERENCES_SIZE) break;
+
+    const subName = skillMatch[1];
+    if (ctx.visitedSkills.has(subName)) continue;
+    ctx.visitedSkills.add(subName);
+
+    const resolved = resolveSkillPath(subName, cwd);
+    if (!resolved) {
+      console.log(`[ClaudeCLI] Sub-skill "${subName}" not found in project or plugin cache, skipping`);
+      continue;
+    }
+
+    try {
+      const subContent = readFileSync(resolved.skillPath, "utf-8");
+      const size = Buffer.byteLength(subContent, "utf-8");
+      if (ctx.totalSize + size > MAX_SKILL_REFERENCES_SIZE) {
+        console.log(`[ClaudeCLI] Skill references size cap reached, skipping sub-skill: ${subName}`);
+        break;
+      }
+      ctx.totalSize += size;
+
+      // Recurse into sub-skill for its own file references and further sub-skills
+      const nested = loadReferencesRecursive(subContent, resolved.skillDir, cwd, ctx);
+
+      subSkills.push({
+        name: subName,
+        skillContent: subContent,
+        references: nested.refs,
+      });
+      // Propagate any sub-sub-skills discovered during recursion
+      subSkills.push(...nested.subSkills);
+
+      console.log(`[ClaudeCLI] Loaded sub-skill reference: ${subName} from ${resolved.skillPath} (${nested.refs.length} refs)`);
+    } catch (err) {
+      console.log(`[ClaudeCLI] Failed to read sub-skill ${subName}: ${(err as Error).message}`);
+    }
+  }
+
+  return { refs, subSkills };
+}
+
+/** Format loaded references into XML sections for prompt injection */
+function formatReferences(loaded: LoadedReferences): string {
+  let out = "";
+
+  // Primary skill file references
+  if (loaded.primaryRefs.length > 0) {
+    out += "\n\n<skill-references>\n";
+    for (const ref of loaded.primaryRefs) {
+      out += `<reference path="${ref.displayPath}">\n${ref.content}\n</reference>\n`;
+    }
+    out += "</skill-references>";
+  }
+
+  // Sub-skill references
+  if (loaded.subSkills.length > 0) {
+    out +=
+      "\n\n<sub-skill-references>\n" +
       "The following skills are referenced in the workflow above. " +
-      "Use their schema knowledge and query patterns when making Athena queries directly.\n\n" +
-      refs.join("\n\n") +
-      "\n</sub-skill-references>"
-    : "";
+      "Use their schema knowledge and query patterns when making Athena queries directly.\n\n";
+
+    for (const sub of loaded.subSkills) {
+      out += `<skill-reference name="${sub.name}">\n${sub.skillContent}\n</skill-reference>\n`;
+
+      if (sub.references.length > 0) {
+        out += `\n<skill-reference-files name="${sub.name}">\n`;
+        for (const ref of sub.references) {
+          out += `<reference path="${ref.displayPath}">\n${ref.content}\n</reference>\n`;
+        }
+        out += `</skill-reference-files>\n`;
+      }
+
+      out += "\n";
+    }
+
+    out += "</sub-skill-references>";
+  }
+
+  return out;
 }
 
 export function spawnClaudeCli(
